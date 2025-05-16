@@ -1,20 +1,35 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <title>Wi-Fi Configuration</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WiFi Network Selector</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<h2>Wi-Fi Configuration</h2>
+<div id="app">
+    <div id="spinner"></div>
+    <h1>Select a WiFi Network</h1>
+    <ul id="networkList" aria-label="List of WiFi Networks"></ul>
+    <div id="error"></div>
 
-<form method='post' action='/'>
-    SSID:<br><input type='text' name='ssid'><br>
-    Password:<br><input type='password' name='password'><br><br>
-    <input type='submit' value='Save'>
+    <div id="networkDetails" class="hidden">
+        <form action="/" id="networkForm" method="post">
+            <h2 id="selectedSSID" aria-live="polite"></h2>
+            <label for="networkPassword">Network Password:</label>
+            <input type="text" name="password" id="networkPassword" placeholder="Enter password" aria-required="true"
+                   aria-label="Network Password"/>
+            <input type="hidden" name="ssid" id="networkSSID"/>
+            <div class="flex">
+                <button type="submit" aria-label="Confirm Connection">Save Wifi credentials</button>
+                <button type="button" onclick="cancelSelection()" aria-label="Cancel Selection">Cancel</button>
+            </div>
+        </form>
+    </div>
+</div>
 
-</form>
+<script src="script.js">
+</script>
 
-<script src="script.js" async></script>
 </body>
 </html>

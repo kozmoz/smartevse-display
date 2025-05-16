@@ -3,6 +3,8 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include <map>
+
 #include "esp_wifi.h"
 #include "esp_http_server.h"
 #include <time.h>
@@ -121,9 +123,22 @@ LGFX_Button smartButton;
  *         about an available WiFi network, sorted by signal strength
  *         in ascending order.
  */
+static std::vector<WifiNetwork> cached_networks;
+static unsigned long last_scan_time = 0;
+const unsigned long SCAN_INTERVAL = 10000; // 10 seconds
+
 std::vector<WifiNetwork> scanWifiNetworks() {
-    std::vector<WifiNetwork> networks;
+    unsigned long current_time = millis();
+
+    if (current_time - last_scan_time < SCAN_INTERVAL) {
+        return cached_networks;
+    }
+
+    last_scan_time = current_time;
+
     const int n = WiFi.scanNetworks();
+    std::vector<WifiNetwork> networks;
+
     for (int i = 0; i < n; ++i) {
         WifiNetwork network = {
             WiFi.SSID(i),
@@ -132,10 +147,28 @@ std::vector<WifiNetwork> scanWifiNetworks() {
         };
         networks.push_back(network);
     }
+
+    // Remove duplicates, keep strongest signal
+    std::map<String, WifiNetwork> unique_networks;
+    for (const auto &network: networks) {
+        auto it = unique_networks.find(network.ssid);
+        if (it == unique_networks.end() || network.rssi > it->second.rssi) {
+            unique_networks[network.ssid] = network;
+        }
+    }
+
+    networks.clear();
+    for (const auto &pair: unique_networks) {
+        networks.push_back(pair.second);
+    }
+
+    // Sort. Best networks on top.
     std::sort(networks.begin(), networks.end(),
               [](const WifiNetwork &a, const WifiNetwork &b) {
-                  return a.rssi < b.rssi;
+                  return a.rssi > b.rssi;
               });
+
+    cached_networks = networks;
     return networks;
 }
 
@@ -156,7 +189,8 @@ esp_err_t get_handler(httpd_req_t *req) {
         String json;
         serializeJson(doc, json);
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, json.c_str(), json.length());
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        httpd_resp_send(req, json.c_str(), static_cast<ssize_t>(json.length()));
         return ESP_OK;
     }
 
@@ -167,10 +201,13 @@ esp_err_t get_handler(httpd_req_t *req) {
         uri = "/index.html";
     }
     auto contentType = "text/html";
-    if (uri.endsWith(".css")) {
+    bool isCss = uri.endsWith(".css");
+    bool isJs = uri.endsWith(".js");
+
+    if (isCss) {
         contentType = "text/css";
     }
-    if (uri.endsWith(".js")) {
+    if (isJs) {
         contentType = "application/javascript";
     }
 
@@ -208,7 +245,10 @@ esp_err_t post_handler(httpd_req_t *req) {
     preferences.putString("ssid", ssid);
     preferences.putString("password", password);
 
-    httpd_resp_send(req, "Configuration Saved. Please Reboot.", -1);
+    httpd_resp_set_status(req, "201 Created");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Location", "/success.html");
+    httpd_resp_send(req, "<script>window.location='/success.html'</script>", -1);
     return ESP_OK;
 }
 
