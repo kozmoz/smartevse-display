@@ -5,6 +5,26 @@
 #include <ArduinoJson.h>
 #include "esp_wifi.h"
 #include "esp_http_server.h"
+#include <time.h>
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+const char *mg_unlist(size_t no);
+
+const char *mg_unpack(const char *name, size_t *size, time_t *mtime);
+
+struct packed_file {
+    const char *name;
+    const unsigned char *data;
+    size_t size;
+    time_t mtime;
+};
+
+extern const struct packed_file packed_files[];
+#if defined(__cplusplus)
+}
+#endif
 
 #define WIFI_SSID "M5Stack-Config"
 #define WIFI_PASS "12345678"
@@ -23,6 +43,7 @@
 #define ACTIVE_BORDER_COLOR TFT_WHITE
 #define TEXT_COLOR TFT_WHITE
 #define BACKGROUND_COLOR TFT_BLACK
+
 // Fonts
 #define NORMAL_FONT &fonts::FreeSans12pt7b
 #define BOLD_FONT &fonts::FreeSansBold12pt7b
@@ -57,21 +78,31 @@ struct WifiNetwork {
 
 // ---- Function Prototypes ----
 void showWiFiConnectingAnimation();
+
 void stopWiFiConnectingAnimation();
+
 void sendModeChange(const String &newMode);
+
 void showWiFiRetryMenu();
+
 void drawUI();
+
 void fetchData();
+
 void drawEVSEScreen();
+
 void showSettingsMenu();
-void configureSetting(const char* key, String &value);
+
+void configureSetting(const char *key, String &value);
+
 bool isValidIP(const String &ip);
+
 bool connectToWiFi(String ssid, String password);
 
 String inputBuffer = "";
 bool shiftMode = false;
 
-const char* keyboardLayout[4][10] = {
+const char *keyboardLayout[4][10] = {
     {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"},
     {"q", "w", "e", "r", "t", "y", "u", "i", "o", "p"},
     {"a", "s", "d", "f", "g", "h", "j", "k", "l", "←"},
@@ -83,6 +114,13 @@ LGFX_Button solarButton;
 LGFX_Button smartButton;
 
 
+/**
+ * Scans for available WiFi networks and retrieves their details.
+ *
+ * @return A vector of WifiNetwork objects, each containing information
+ *         about an available WiFi network, sorted by signal strength
+ *         in ascending order.
+ */
 std::vector<WifiNetwork> scanWifiNetworks() {
     std::vector<WifiNetwork> networks;
     const int n = WiFi.scanNetworks();
@@ -122,17 +160,40 @@ esp_err_t get_handler(httpd_req_t *req) {
         return ESP_OK;
     }
 
-    const char *response = "<html><body><h2>Wi-Fi Configuration</h2>"
-            "<form method='post' action='/'>"
-            "SSID:<br><input type='text' name='ssid'><br>"
-            "Password:<br><input type='password' name='password'><br><br>"
-            "<input type='submit' value='Save'>"
-            "</form></body></html>";
-    httpd_resp_send(req, response, strlen(response));
-    return ESP_OK;
+    size_t size = 0;
+    time_t mtime = 0;
+    String uri = String(req->uri);
+    if (uri == "/") {
+        uri = "/index.html";
+    }
+    auto contentType = "text/html";
+    if (uri.endsWith(".css")) {
+        contentType = "text/css";
+    }
+    if (uri.endsWith(".js")) {
+        contentType = "application/javascript";
+    }
+
+    auto path = String("/data" + uri).c_str();
+    auto data = mg_unpack(path, &size, &mtime);
+    if (data != NULL) {
+        httpd_resp_set_type(req, contentType);
+        char timeStr[32];
+        strftime(timeStr, sizeof(timeStr), "%a, %d %b %Y %H:%M:%S GMT", gmtime(&mtime));
+        httpd_resp_set_hdr(req, "Last-Modified", timeStr);
+        httpd_resp_send(req, data, static_cast<ssize_t>(size));
+
+        return ESP_OK;
+    }
+
+    String notFound = "Not found 404";
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_status(req, "404 Not Found");
+    httpd_resp_send(req, notFound.c_str(), static_cast<ssize_t>(notFound.length()));
+    return ESP_ERR_NOT_FOUND;
 }
 
-static esp_err_t post_handler(httpd_req_t *req) {
+esp_err_t post_handler(httpd_req_t *req) {
     char buf[128];
     int ret = httpd_req_recv(req, buf, req->content_len);
     if (ret <= 0) {
@@ -146,7 +207,7 @@ static esp_err_t post_handler(httpd_req_t *req) {
 
     preferences.putString("ssid", ssid);
     preferences.putString("password", password);
-    
+
     httpd_resp_send(req, "Configuration Saved. Please Reboot.", -1);
     return ESP_OK;
 }
@@ -154,27 +215,24 @@ static esp_err_t post_handler(httpd_req_t *req) {
 void start_webserver() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     httpd_handle_t server = NULL;
+    // Add wildcard support.
+    // https://community.platformio.org/t/esp-http-server-h-has-no-wildcard/11732
+    config.uri_match_fn = httpd_uri_match_wildcard;
     httpd_start(&server, &config);
 
-    httpd_uri_t get_uri = {
-        .uri = "/",
+httpd_uri_t get_uri = {
+        .uri = "*",
         .method = HTTP_GET,
         .handler = get_handler
     };
     httpd_register_uri_handler(server, &get_uri);
-
-    httpd_uri_t wifi_uri = {
-        .uri = "/api/wifi",
-        .method = HTTP_GET,
-        .handler = get_handler
-    };
-    httpd_register_uri_handler(server, &wifi_uri);
 
     httpd_uri_t post_uri = {
         .uri = "/",
         .method = HTTP_POST,
         .handler = post_handler
     };
+    httpd_register_uri_handler(server, &post_uri);
 }
 
 void start_ap_mode() {
@@ -329,14 +387,14 @@ void updateButtonState() {
 }
 
 void playBeep() {
-    M5.Speaker.tone(1000, 50);  // 4000 Hz for 100 ms
+    M5.Speaker.tone(1000, 50); // 4000 Hz for 100 ms
 }
 
 // ---- Setup ----
 void setup() {
     // Initialize M5Stack Tough
     auto cfg = M5.config();
-    cfg.external_spk = true;  // Enable the external speaker if available
+    cfg.external_spk = true; // Enable the external speaker if available
     M5.begin(cfg);
 
     // M5.Display.setFont(NORMAL_FONT);
@@ -347,7 +405,7 @@ void setup() {
 
     // Initialize speaker
     M5.Speaker.begin();
-    M5.Speaker.setVolume(200);  // Max volume for beep
+    M5.Speaker.setVolume(200); // Max volume for beep
 
     // Initialize buttons
     solarButton.initButton(&M5.Display, SOLAR_BUTTON_X + BUTTON_WIDTH / 2, BUTTON_Y + BUTTON_HEIGHT / 2,
@@ -367,7 +425,6 @@ void setup() {
         start_ap_mode();
         start_webserver();
     }
-
 }
 
 static unsigned long lastCheck1S = 0;
@@ -375,8 +432,7 @@ static unsigned long lastCheck2S = 0;
 
 // ---- Main Loop ----
 void loop() {
-
-    M5.update();  // Update touch and button states
+    M5.update(); // Update touch and button states
 
     if (wifiConnected) {
         // Check for touch events
@@ -443,8 +499,8 @@ bool connectToWiFi(String ssid, String password) {
         // M5.Lcd.println("WiFi Connected");
         return true;
     }
-        // M5.Lcd.println("Failed to connect.");
-        // showWiFiRetryMenu();
+    // M5.Lcd.println("Failed to connect.");
+    // showWiFiRetryMenu();
     return false;
 }
 
@@ -505,7 +561,7 @@ void drawUI() {
     // Reset error area.
     M5.Lcd.fillRect(0, 224, 340, 20, TFT_BLACK);
     // Reset mode.
-    M5.Lcd.fillRect(184, 204, 340-184, 20, TFT_BLACK);
+    M5.Lcd.fillRect(184, 204, 340 - 184, 20, TFT_BLACK);
 
     M5.Lcd.setTextSize(2);
 
@@ -534,7 +590,6 @@ void drawUI() {
     // Rest text color.
     M5.Lcd.setTextColor(TEXT_COLOR);
 }
-
 
 
 // ---- Draw EVSE Screen (Live) ----
@@ -570,7 +625,8 @@ void sendModeChange(const String &newMode) {
     if (wifiConnected) {
         HTTPClient http;
         // String url = "http://" + evse_ip + "/settings?mode=" + newMode + "&starttime=0&override_current=0&repeat=0";
-        String url = "http://" + evse_ip + "/settings?mode=" + newMode + "&override_current=0&starttime=2025-05-15T00:27&stoptime=2025-05-15T00:27&repeat=0";
+        String url = "http://" + evse_ip + "/settings?mode=" + newMode +
+                     "&override_current=0&starttime=2025-05-15T00:27&stoptime=2025-05-15T00:27&repeat=0";
 
         http.begin(url);
         // http.addHeader("Content-Type", "application/json");
@@ -603,7 +659,6 @@ void sendModeChange(const String &newMode) {
         http.end();
     }
 }
-
 
 
 // ---- Timeout Message ----
@@ -682,7 +737,7 @@ void showSettingsMenu() {
 }
 
 
-void configureSetting(const char* key, String &value) {
+void configureSetting(const char *key, String &value) {
     M5.Lcd.clear(TFT_BLACK);
     M5.Lcd.setCursor(10, 40);
     M5.Lcd.printf("Change %s:", key);
@@ -705,4 +760,3 @@ bool isValidIP(const String &ip) {
     IPAddress addr;
     return addr.fromString(ip);
 }
-
