@@ -7,7 +7,8 @@
 
 #include "esp_wifi.h"
 #include "esp_http_server.h"
-#include <time.h>
+#include <ctime>
+#include <ESPmDNS.h>
 
 #if defined(__cplusplus)
 extern "C" {
@@ -50,15 +51,18 @@ extern const struct packed_file packed_files[];
 #define NORMAL_FONT &fonts::FreeSans12pt7b
 #define BOLD_FONT &fonts::FreeSansBold12pt7b
 
+const String DEVICE_NAME = "smartevse-display";
+const String AP_HOSTNAME = DEVICE_NAME + "-" + String((uint32_t)ESP.getEfuseMac() & 0xffff, 10);
+
 // ---- Configuration ----
 Preferences preferences;
-String ssid = "Juurlink123";
+String ssid = "Juurlink";
 String password = "1122334411";
-String evse_ip = "192.168.1.172";
+String smartevse_host = "192.168.1.172";
 // EVSE connected
-bool evseConnected = false;
+bool evse_connected = false;
 // WiFi connected
-bool wifiConnected = false;
+bool wifi_connected = false;
 
 // Globale variabelen
 String evseState = "Not Connected";
@@ -68,9 +72,9 @@ int gridCurrent = 0;
 String error = "None";
 
 // ---- UI Elements ----
-M5Canvas canvas(&M5.Lcd);
-const int screenWidth = 240;
-const int screenHeight = 320;
+M5Canvas canvas(&M5.Display);
+const int SCREEN_WIDTH = 240;
+const int SCREEN_HEIGHT = 320;
 
 struct WifiNetwork {
     String ssid;
@@ -172,8 +176,29 @@ std::vector<WifiNetwork> scanWifiNetworks() {
     return networks;
 }
 
-esp_err_t get_handler(httpd_req_t *req) {
+std::vector<String> discoverMDNS() {
+    std::vector<String> hosts;
 
+    // Search for _hwenergy._tcp services.
+    // https://api-documentation.homewizard.com/docs/discovery/
+    // const int n = MDNS.queryService("_services", "_dns-sd._udp");
+    const int n = MDNS.queryService("http", "tcp");
+    if (n < 0) {
+        hosts = {"MDNS query failed."};
+    } else if (n == 0) {
+        hosts = {"No MDNS services found."};
+    } else {
+        for (int i = 0; i < n; i++) {
+            String hostname = MDNS.hostname(i);
+            const uint16_t port = MDNS.port(i);
+            String ip = MDNS.IP(i).toString();
+            hosts.push_back("Host: " + hostname + ":" + port + " (" + ip + ")");
+        }
+    }
+    return hosts;
+}
+
+esp_err_t get_handler(httpd_req_t *req) {
     if (strcmp(req->uri, "/api/wifi") == 0) {
         auto networks = scanWifiNetworks();
         JsonDocument doc;
@@ -184,6 +209,24 @@ esp_err_t get_handler(httpd_req_t *req) {
             network["ssid"] = networks[i].ssid;
             network["rssi"] = networks[i].rssi;
             network["open"] = networks[i].isOpen;
+        }
+
+        String json;
+        serializeJson(doc, json);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        httpd_resp_send(req, json.c_str(), static_cast<ssize_t>(json.length()));
+        return ESP_OK;
+    }
+
+    if (strcmp(req->uri, "/api/mdns") == 0) {
+        auto hosts = discoverMDNS();
+        JsonDocument doc;
+        JsonArray array = doc.to<JsonArray>();
+
+        for (size_t i = 0; i < hosts.size(); i++) {
+            JsonObject network = array.add<JsonObject>();
+            network["host"] = hosts[i];
         }
 
         String json;
@@ -254,13 +297,13 @@ esp_err_t post_handler(httpd_req_t *req) {
 
 void start_webserver() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    httpd_handle_t server = NULL;
+    httpd_handle_t server = nullptr;
     // Add wildcard support.
     // https://community.platformio.org/t/esp-http-server-h-has-no-wildcard/11732
     config.uri_match_fn = httpd_uri_match_wildcard;
     httpd_start(&server, &config);
 
-httpd_uri_t get_uri = {
+    httpd_uri_t get_uri = {
         .uri = "*",
         .method = HTTP_GET,
         .handler = get_handler
@@ -360,10 +403,14 @@ String showVirtualKeyboard() {
     }
 }
 
-void displayMonochromeBitmap(WiFiClient *stream, int width, int height, int x, int y) {
+void displayMonochromeBitmap(WiFiClient *stream, int width, int height, int x, int y,
+    int fcolor = TFT_WHITE, int bcolor = TFT_BLACK) {
+
     // Skip the bitmap header
+    // Todo: The header is off.
+    // uint8_t header[62];
     uint8_t header[67];
-    stream->read(header, 67);
+    stream->read(header, sizeof(header));
 
     // Calculate bytes per row (1 bit per pixel, 8 pixels per byte)
     const int bytesPerRow = width / 8; // Ceiling of width/8
@@ -403,7 +450,7 @@ void displayMonochromeBitmap(WiFiClient *stream, int width, int height, int x, i
             // Process each bit in the byte (left to right)
             for (int bit = 0; bit < 8 && col * 8 + bit < width; ++bit) {
                 // Duplicate each pixel horizontally (2 pixels per original pixel)
-                uint16_t pixel = (byte & (1 << bit)) ? TFT_WHITE : TFT_BLACK;
+                uint16_t pixel = (byte & (1 << bit)) ? fcolor : bcolor;
                 buffer[bufferIndex++] = pixel;
                 buffer[bufferIndex++] = pixel; // Double horizontally
             }
@@ -420,8 +467,17 @@ void displayMonochromeBitmap(WiFiClient *stream, int width, int height, int x, i
 }
 
 void updateButtonState() {
-    solarButton.setOutlineColor((mode == "Solar") ? ACTIVE_BORDER_COLOR : BACKGROUND_COLOR);
-    smartButton.setOutlineColor((mode == "Smart") ? ACTIVE_BORDER_COLOR : BACKGROUND_COLOR); // White border for active
+    if (evse_connected) {
+        solarButton.setFillColor( 0xF680);
+        solarButton.setOutlineColor((mode == "Solar") ? ACTIVE_BORDER_COLOR : BACKGROUND_COLOR);
+        smartButton.setFillColor( 0x07E0);
+        smartButton.setOutlineColor((mode == "Smart") ? ACTIVE_BORDER_COLOR : BACKGROUND_COLOR); // White border for active
+    } else {
+        solarButton.setFillColor( TFT_DARKGRAY);
+        solarButton.setOutlineColor(BACKGROUND_COLOR);
+        smartButton.setFillColor( TFT_DARKGRAY);
+        smartButton.setOutlineColor(BACKGROUND_COLOR);
+    }
     solarButton.drawButton();
     smartButton.drawButton();
 }
@@ -454,17 +510,29 @@ void setup() {
                            BUTTON_WIDTH, BUTTON_HEIGHT, BACKGROUND_COLOR, 0x07E0, TFT_BLACK, "Smart", 3);
 
 
-    preferences.begin("EVSE", false);
+    preferences.begin("smartevse-display", false);
     ssid = preferences.getString("ssid", ssid);
     password = preferences.getString("password", password);
-    evse_ip = preferences.getString("evse_ip", evse_ip);
+    smartevse_host = preferences.getString("smartevse_host", smartevse_host);
 
-    wifiConnected = connectToWiFi(ssid, password);
+    wifi_connected = connectToWiFi(ssid, password);
 
-    if (!wifiConnected) {
+    if (!wifi_connected) {
         start_ap_mode();
-        start_webserver();
     }
+
+    int retries = 5;
+    while (!MDNS.begin(AP_HOSTNAME.c_str()) && retries-- > 0) {
+        delay(1000);
+    }
+
+    if (retries <= 0) {
+        error = "Error starting mDNS";
+    } else {
+        MDNS.addService("http", "tcp", 80);   // announce Web server
+    }
+
+    start_webserver();
 }
 
 static unsigned long lastCheck1S = 0;
@@ -474,7 +542,7 @@ static unsigned long lastCheck2S = 0;
 void loop() {
     M5.update(); // Update touch and button states
 
-    if (wifiConnected) {
+    if (wifi_connected) {
         // Check for touch events
         if (M5.Touch.getCount() > 0) {
             auto touchPoint = M5.Touch.getDetail(0);
@@ -482,7 +550,7 @@ void loop() {
             int y = touchPoint.y;
 
             // Check Solar button
-            if (solarButton.contains(x, y) && mode != "Solar") {
+            if (evse_connected && mode != "Solar" && solarButton.contains(x, y)) {
                 mode = "Solar";
                 updateButtonState();
                 drawUI();
@@ -492,7 +560,7 @@ void loop() {
                 smartButton.press(false);
             }
             // Check Smart button
-            else if (smartButton.contains(x, y) && mode != "Smart") {
+            else if (evse_connected && mode != "Smart" && smartButton.contains(x, y)) {
                 mode = "Smart";
                 updateButtonState();
                 drawUI();
@@ -548,13 +616,13 @@ bool connectToWiFi(String ssid, String password) {
 void showTimeoutMessage();
 
 void fetchData() {
-    if (!wifiConnected) {
-        evseConnected = false;
+    if (!wifi_connected) {
+        evse_connected = false;
         return;
     }
 
     HTTPClient http;
-    String url = "http://" + evse_ip + "/settings";
+    String url = "http://" + smartevse_host + "/settings";
     http.begin(url);
     http.setTimeout(5000);
 
@@ -562,13 +630,13 @@ void fetchData() {
 
     if (httpResponseCode < 300) {
         String payload = http.getString();
-        evseConnected = true;
+        evse_connected = true;
 
         // JSON parsing
         JsonDocument doc;
-        DeserializationError error = deserializeJson(doc, payload);
+        DeserializationError jsonError = deserializeJson(doc, payload);
 
-        if (!error) {
+        if (!jsonError) {
             // Extract values from JSON en update de globale variabelen
             chargeCurrent = doc["settings"]["charge_current"];
             gridCurrent = doc["phase_currents"]["TOTAL"];
@@ -583,11 +651,11 @@ void fetchData() {
                 mode = "Smart";
             }
         } else {
-            M5.Lcd.setCursor(10, 220);
-            M5.Lcd.println("JSON Parsing Failed");
+            evse_connected = false;
+            error = "JSON Failed";
         }
     } else {
-        evseConnected = false;
+        evse_connected = false;
         showTimeoutMessage();
     }
 
@@ -609,20 +677,20 @@ void drawUI() {
     M5.Lcd.setTextColor(TFT_LIGHTGRAY);
     M5.Lcd.setCursor(16, 204);
     M5.Lcd.print("WIFI");
-    M5.Lcd.fillCircle(76, 210, 5, wifiConnected ? TFT_GREEN : TFT_RED);
+    M5.Lcd.fillCircle(76, 210, 5, wifi_connected ? TFT_GREEN : TFT_RED);
 
     // The EVSE Status Indicator.
     M5.Lcd.setTextColor(TFT_LIGHTGRAY);
     M5.Lcd.setCursor(100, 204);
     M5.Lcd.print("EVSE ");
-    M5.Lcd.fillCircle(160, 210, 5, evseConnected ? TFT_GREEN : TFT_RED);
+    M5.Lcd.fillCircle(160, 210, 5, evse_connected ? TFT_GREEN : TFT_RED);
 
     // The Mode.
     M5.Lcd.setTextColor(TFT_LIGHTGRAY);
     M5.Lcd.setCursor(184, 204);
-    M5.Lcd.print("Mode:" + mode);
+    M5.Lcd.print("Mode:" + ( evse_connected ? mode : "-"));
 
-    // Error
+    // Show Error.
     M5.Lcd.setTextColor(error == "" || error == "None" ? TFT_DARKGRAY : TFT_RED);
     M5.Lcd.setCursor(16, 224);
     M5.Lcd.print("Error: " + error);
@@ -634,9 +702,9 @@ void drawUI() {
 
 // ---- Draw EVSE Screen (Live) ----
 void drawEVSEScreen() {
-    if (wifiConnected) {
+    if (wifi_connected) {
         HTTPClient http;
-        const String url = "http://" + evse_ip + "/lcd";
+        const String url = "http://" + smartevse_host + "/lcd";
         http.begin(url);
         http.setTimeout(5000);
 
@@ -645,12 +713,23 @@ void drawEVSEScreen() {
         if (httpResponseCode == 200) {
             WiFiClient *stream = http.getStreamPtr();
             displayMonochromeBitmap(stream, 128, 64, 32, 0);
-            // M5.Lcd.setCursor(10, 10);
-            // M5.Lcd.setTextSize(1);
-            // M5.Lcd.println("Loaded LCD screen");
         } else {
-            M5.Lcd.setCursor(10, 10);
-            M5.Lcd.println("Failed to load LCD screen");
+            // Display placeholder image.
+            auto path = String("/data/lcd-placeholder.png").c_str();
+            size_t size = 0;
+            time_t mtime = 0;
+            const char *data = mg_unpack(path, &size, &mtime);
+            if (data != nullptr) {
+                if (!M5.Display.drawPng((uint8_t*) data, size, 32, 0)) {
+                    M5.Display.setTextColor(TFT_RED);
+                    M5.Display.setCursor(16, 10);
+                    M5.Display.println("Failed to decode PNG");
+                }
+            } else {
+                M5.Display.setTextColor(TFT_RED);
+                M5.Display.setCursor(16, 10);
+                M5.Display.println("File not found");
+            }
         }
         http.end();
     }
@@ -662,10 +741,10 @@ void drawEVSEScreen() {
  * @param newMode 2 = Solar, 3 = Smart
  */
 void sendModeChange(const String &newMode) {
-    if (wifiConnected) {
+    if (wifi_connected) {
         HTTPClient http;
         // String url = "http://" + evse_ip + "/settings?mode=" + newMode + "&starttime=0&override_current=0&repeat=0";
-        String url = "http://" + evse_ip + "/settings?mode=" + newMode +
+        String url = "http://" + smartevse_host + "/settings?mode=" + newMode +
                      "&override_current=0&starttime=2025-05-15T00:27&stoptime=2025-05-15T00:27&repeat=0";
 
         http.begin(url);
@@ -770,7 +849,7 @@ void showWiFiRetryMenu() {
 void showSettingsMenu() {
     configureSetting("SSID", ssid);
     configureSetting("Password", password);
-    configureSetting("EVSE IP", evse_ip);
+    configureSetting("EVSE IP", smartevse_host);
 
     // Toon het hoofdscherm opnieuw na aanpassingen
     drawUI();
