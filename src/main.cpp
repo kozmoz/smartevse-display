@@ -10,24 +10,21 @@
 #include <ctime>
 #include <ESPmDNS.h>
 
-#if defined(__cplusplus)
+// The included functions are in a C file.
 extern "C" {
-#endif
-const char *mg_unlist(size_t no);
+    const char *mg_unlist(size_t no);
 
-const char *mg_unpack(const char *name, size_t *size, time_t *mtime);
+    const char *mg_unpack(const char *name, size_t *size, time_t *mtime);
 
-struct packed_file {
-    const char *name;
-    const unsigned char *data;
-    size_t size;
-    time_t mtime;
-};
+    struct packed_file {
+        const char *name;
+        const unsigned char *data;
+        size_t size;
+        time_t mtime;
+    };
 
-extern const struct packed_file packed_files[];
-#if defined(__cplusplus)
+    extern const struct packed_file packed_files[];
 }
-#endif
 
 #define WIFI_SSID "M5Stack-Config"
 #define WIFI_PASS "12345678"
@@ -486,6 +483,8 @@ void playBeep() {
     M5.Speaker.tone(1000, 50); // 4000 Hz for 100 ms
 }
 
+#ifndef UNIT_TEST
+
 // ---- Setup ----
 void setup() {
     // Initialize M5Stack Tough
@@ -587,6 +586,7 @@ void loop() {
 
     delay(50);
 }
+#endif // UNIT_TEST
 
 bool connectToWiFi(String ssid, String password) {
     //M5.Lcd.println("Connecting to WiFi...");
