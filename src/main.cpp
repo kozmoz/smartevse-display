@@ -12,18 +12,18 @@
 
 // The included functions are in a C file.
 extern "C" {
-    const char *mg_unlist(size_t no);
+const char *mg_unlist(size_t no);
 
-    const char *mg_unpack(const char *name, size_t *size, time_t *mtime);
+const char *mg_unpack(const char *name, size_t *size, time_t *mtime);
 
-    struct packed_file {
-        const char *name;
-        const unsigned char *data;
-        size_t size;
-        time_t mtime;
-    };
+struct packed_file {
+    const char *name;
+    const unsigned char *data;
+    size_t size;
+    time_t mtime;
+};
 
-    extern const struct packed_file packed_files[];
+extern const struct packed_file packed_files[];
 }
 
 #define WIFI_SSID "M5Stack-Config"
@@ -49,13 +49,14 @@ extern "C" {
 #define BOLD_FONT &fonts::FreeSansBold12pt7b
 
 const String DEVICE_NAME = "smartevse-display";
-const String AP_HOSTNAME = DEVICE_NAME + "-" + String((uint32_t)ESP.getEfuseMac() & 0xffff, 10);
+const String AP_HOSTNAME = DEVICE_NAME + "-" + String((uint32_t) ESP.getEfuseMac() & 0xffff, 10);
 
 // ---- Configuration ----
 Preferences preferences;
 String ssid = "Juurlink";
 String password = "1122334411";
-String smartevse_host = "192.168.1.172";
+String smartevse_host;
+
 // EVSE connected
 bool evse_connected = false;
 // WiFi connected
@@ -77,6 +78,12 @@ struct WifiNetwork {
     String ssid;
     int rssi;
     bool isOpen;
+};
+
+struct MDNSHost {
+    String host;
+    String ip;
+    int port;
 };
 
 // ---- Function Prototypes ----
@@ -126,15 +133,14 @@ LGFX_Button smartButton;
  */
 static std::vector<WifiNetwork> cached_networks;
 static unsigned long last_scan_time = 0;
-const unsigned long SCAN_INTERVAL = 10000; // 10 seconds
+const unsigned long SCAN_INTERVAL = 30000; // 10 seconds
 
 std::vector<WifiNetwork> scanWifiNetworks() {
     unsigned long current_time = millis();
 
-    if (current_time - last_scan_time < SCAN_INTERVAL) {
+    if (last_scan_time != 0 && current_time - last_scan_time < SCAN_INTERVAL) {
         return cached_networks;
     }
-
     last_scan_time = current_time;
 
     const int n = WiFi.scanNetworks();
@@ -173,26 +179,54 @@ std::vector<WifiNetwork> scanWifiNetworks() {
     return networks;
 }
 
-std::vector<String> discoverMDNS() {
-    std::vector<String> hosts;
+static std::vector<MDNSHost> cached_mdns_hosts;
+static unsigned long last_mdns_query = 0;
+const unsigned long MDNS_QUERY_INTERVAL = 30000; // 10 seconds
 
-    // Search for _hwenergy._tcp services.
-    // https://api-documentation.homewizard.com/docs/discovery/
-    // const int n = MDNS.queryService("_services", "_dns-sd._udp");
-    const int n = MDNS.queryService("http", "tcp");
-    if (n < 0) {
-        hosts = {"MDNS query failed."};
-    } else if (n == 0) {
-        hosts = {"No MDNS services found."};
-    } else {
-        for (int i = 0; i < n; i++) {
-            String hostname = MDNS.hostname(i);
-            const uint16_t port = MDNS.port(i);
-            String ip = MDNS.IP(i).toString();
-            hosts.push_back("Host: " + hostname + ":" + port + " (" + ip + ")");
-        }
+std::vector<MDNSHost> discoverMDNS() {
+    unsigned long current_time = millis();
+
+    if (last_mdns_query != 0 && current_time - last_mdns_query < MDNS_QUERY_INTERVAL) {
+        return cached_mdns_hosts;
     }
-    return hosts;
+    last_mdns_query = current_time;
+
+    std::vector<MDNSHost> hosts;
+    int retry_count = 3;
+
+    while (retry_count > 0) {
+        const int n = MDNS.queryService("http", "tcp");
+        if (n > 0) {
+            for (int i = 0; i < n; i++) {
+                const String hostname = MDNS.hostname(i);
+                if (!hostname.startsWith("SmartEVSE")) {
+                    continue;
+                }
+                bool exists = false;
+                for (auto &host: hosts) {
+                    if (host.host == hostname) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) {
+                    hosts.push_back({
+                        hostname,
+                        MDNS.IP(i).toString(),
+                        MDNS.port(i)
+                    });
+                }
+            }
+        }
+        retry_count--;
+        delay(1000); // Wait between retries.
+    }
+
+    if (!hosts.empty()) {
+        cached_mdns_hosts = hosts;
+    }
+
+    return !hosts.empty() ? hosts : cached_mdns_hosts;
 }
 
 esp_err_t get_handler(httpd_req_t *req) {
@@ -223,7 +257,7 @@ esp_err_t get_handler(httpd_req_t *req) {
 
         for (size_t i = 0; i < hosts.size(); i++) {
             JsonObject network = array.add<JsonObject>();
-            network["host"] = hosts[i];
+            network["host"] = hosts[i].host;
         }
 
         String json;
@@ -253,7 +287,7 @@ esp_err_t get_handler(httpd_req_t *req) {
 
     auto path = String("/data" + uri).c_str();
     auto data = mg_unpack(path, &size, &mtime);
-    if (data != NULL) {
+    if (data != nullptr) {
         httpd_resp_set_type(req, contentType);
         char timeStr[32];
         strftime(timeStr, sizeof(timeStr), "%a, %d %b %Y %H:%M:%S GMT", gmtime(&mtime));
@@ -333,27 +367,27 @@ void start_ap_mode() {
 
 
 void drawKeyboard() {
-    M5.Lcd.fillScreen(TFT_BLACK);
+    M5.Display.fillScreen(TFT_BLACK);
     int startY = 120;
 
     for (int row = 0; row < 4; row++) {
         for (int col = 0; col < 10; col++) {
             int x = col * 22 + 10;
             int y = row * 30 + startY;
-            M5.Lcd.drawRect(x, y, 20, 28, TFT_WHITE);
-            M5.Lcd.setCursor(x + 5, y + 8);
+            M5.Display.drawRect(x, y, 20, 28, TFT_WHITE);
+            M5.Display.setCursor(x + 5, y + 8);
             if (shiftMode && row < 3) {
-                M5.Lcd.print(keyboardLayout[row][col][0] - 32); // Toon als hoofdletter
+                M5.Display.print(keyboardLayout[row][col][0] - 32); // Toon als hoofdletter
             } else {
-                M5.Lcd.print(keyboardLayout[row][col]);
+                M5.Display.print(keyboardLayout[row][col]);
             }
         }
     }
 
     // Weergave van de ingevoerde tekst
-    M5.Lcd.setCursor(10, 80);
-    M5.Lcd.fillRect(10, 80, 220, 20, TFT_BLACK); // Clear de lijn
-    M5.Lcd.print(inputBuffer);
+    M5.Display.setCursor(10, 80);
+    M5.Display.fillRect(10, 80, 220, 20, TFT_BLACK); // Clear de lijn
+    M5.Display.print(inputBuffer);
 }
 
 void handleKeyboardTouch() {
@@ -373,7 +407,7 @@ void handleKeyboardTouch() {
             } else if (key == "Shift") {
                 shiftMode = !shiftMode;
             } else if (key == "Enter") {
-                M5.Lcd.fillRect(10, 80, 220, 20, TFT_BLACK);
+                M5.Display.fillRect(10, 80, 220, 20, TFT_BLACK);
                 drawUI();
                 return;
             } else {
@@ -401,8 +435,7 @@ String showVirtualKeyboard() {
 }
 
 void displayMonochromeBitmap(WiFiClient *stream, int width, int height, int x, int y,
-    int fcolor = TFT_WHITE, int bcolor = TFT_BLACK) {
-
+                             int fcolor = TFT_WHITE, int bcolor = TFT_BLACK) {
     // Skip the bitmap header
     // Todo: The header is off.
     // uint8_t header[62];
@@ -420,8 +453,8 @@ void displayMonochromeBitmap(WiFiClient *stream, int width, int height, int x, i
     stream->read(rowData, paddedBytesPerRow * height);
 
     // Begin writing to the display with doubled dimensions
-    M5.Lcd.startWrite();
-    M5.Lcd.setAddrWindow(x, y, width * 2, height * 2);
+    M5.Display.startWrite();
+    M5.Display.setAddrWindow(x, y, width * 2, height * 2);
 
     uint16_t buffer[256]; // Buffer for one doubled row (max 128 * 2 = 256 pixels)
 
@@ -454,25 +487,26 @@ void displayMonochromeBitmap(WiFiClient *stream, int width, int height, int x, i
         }
 
         // Push the row buffer to the display twice for vertical doubling
-        M5.Lcd.pushPixels(buffer, width * 2);
-        M5.Lcd.pushPixels(buffer, width * 2); // Repeat row for 2x vertical scale
+        M5.Display.pushPixels(buffer, width * 2);
+        M5.Display.pushPixels(buffer, width * 2); // Repeat row for 2x vertical scale
     }
 
     // Clean up
     delete[] rowData;
-    M5.Lcd.endWrite();
+    M5.Display.endWrite();
 }
 
 void updateButtonState() {
     if (evse_connected) {
-        solarButton.setFillColor( 0xF680);
+        solarButton.setFillColor(0xF680);
         solarButton.setOutlineColor((mode == "Solar") ? ACTIVE_BORDER_COLOR : BACKGROUND_COLOR);
-        smartButton.setFillColor( 0x07E0);
-        smartButton.setOutlineColor((mode == "Smart") ? ACTIVE_BORDER_COLOR : BACKGROUND_COLOR); // White border for active
+        smartButton.setFillColor(0x07E0);
+        smartButton.setOutlineColor((mode == "Smart") ? ACTIVE_BORDER_COLOR : BACKGROUND_COLOR);
+        // White border for active
     } else {
-        solarButton.setFillColor( TFT_DARKGRAY);
+        solarButton.setFillColor(TFT_DARKGRAY);
         solarButton.setOutlineColor(BACKGROUND_COLOR);
-        smartButton.setFillColor( TFT_DARKGRAY);
+        smartButton.setFillColor(TFT_DARKGRAY);
         smartButton.setOutlineColor(BACKGROUND_COLOR);
     }
     solarButton.drawButton();
@@ -495,8 +529,14 @@ void setup() {
     // M5.Display.setFont(NORMAL_FONT);
     M5.Display.setRotation(1);
     M5.Display.setTextSize(2);
+    M5.Display.setColor(TFT_WHITE);
     // Set display rotation
     M5.Display.fillScreen(BACKGROUND_COLOR);
+
+    // Display is ready, start initializing.
+    M5.Display.setCursor(16, 204);
+    M5.Display.print("Initializing...");
+    M5.Display.display();
 
     // Initialize speaker
     M5.Speaker.begin();
@@ -520,6 +560,7 @@ void setup() {
         start_ap_mode();
     }
 
+    // Initialize MDNS.
     int retries = 5;
     while (!MDNS.begin(AP_HOSTNAME.c_str()) && retries-- > 0) {
         delay(1000);
@@ -528,10 +569,13 @@ void setup() {
     if (retries <= 0) {
         error = "Error starting mDNS";
     } else {
-        MDNS.addService("http", "tcp", 80);   // announce Web server
+        MDNS.addService("http", "tcp", 80); // announce Web server
     }
 
     start_webserver();
+
+    // Reset initializing text.
+    M5.Display.fillRect(16, 204, 340 - 16, 20, TFT_BLACK);
 }
 
 static unsigned long lastCheck1S = 0;
@@ -589,7 +633,7 @@ void loop() {
 #endif // UNIT_TEST
 
 bool connectToWiFi(String ssid, String password) {
-    //M5.Lcd.println("Connecting to WiFi...");
+    //M5.Display.println("Connecting to WiFi...");
 
     WiFi.begin(ssid.c_str(), password.c_str());
     int attempts = 0;
@@ -597,17 +641,17 @@ bool connectToWiFi(String ssid, String password) {
     while (WiFi.status() != WL_CONNECTED && attempts < 5) {
         delay(500);
         attempts++;
-        // M5.Lcd.setCursor(10, 220);
-        // M5.Lcd.printf("Connecting... Attempt %d", attempts);
+        // M5.Display.setCursor(10, 220);
+        // M5.Display.printf("Connecting... Attempt %d", attempts);
     }
     //stopWiFiConnectingAnimation();
 
     if (WiFi.status() == WL_CONNECTED) {
-        // M5.Lcd.setCursor(10, 220);
-        // M5.Lcd.println("WiFi Connected");
+        // M5.Display.setCursor(10, 220);
+        // M5.Display.println("WiFi Connected");
         return true;
     }
-    // M5.Lcd.println("Failed to connect.");
+    // M5.Display.println("Failed to connect.");
     // showWiFiRetryMenu();
     return false;
 }
@@ -664,39 +708,39 @@ void fetchData() {
 
 
 void drawUI() {
-    // M5.Lcd.fillScreen(TFT_BLACK);
+    // M5.Display.fillScreen(TFT_BLACK);
 
     // Reset error area.
-    M5.Lcd.fillRect(0, 224, 340, 20, TFT_BLACK);
+    M5.Display.fillRect(0, 224, 340, 20, TFT_BLACK);
     // Reset mode.
-    M5.Lcd.fillRect(184, 204, 340 - 184, 20, TFT_BLACK);
+    M5.Display.fillRect(184, 204, 340 - 184, 20, TFT_BLACK);
 
-    M5.Lcd.setTextSize(2);
+    M5.Display.setTextSize(2);
 
     // The WiFi Status Indicator.
-    M5.Lcd.setTextColor(TFT_LIGHTGRAY);
-    M5.Lcd.setCursor(16, 204);
-    M5.Lcd.print("WIFI");
-    M5.Lcd.fillCircle(76, 210, 5, wifi_connected ? TFT_GREEN : TFT_RED);
+    M5.Display.setTextColor(TFT_LIGHTGRAY);
+    M5.Display.setCursor(16, 204);
+    M5.Display.print("WIFI");
+    M5.Display.fillCircle(76, 210, 5, wifi_connected ? TFT_GREEN : TFT_RED);
 
     // The EVSE Status Indicator.
-    M5.Lcd.setTextColor(TFT_LIGHTGRAY);
-    M5.Lcd.setCursor(100, 204);
-    M5.Lcd.print("EVSE ");
-    M5.Lcd.fillCircle(160, 210, 5, evse_connected ? TFT_GREEN : TFT_RED);
+    M5.Display.setTextColor(TFT_LIGHTGRAY);
+    M5.Display.setCursor(100, 204);
+    M5.Display.print("EVSE ");
+    M5.Display.fillCircle(160, 210, 5, evse_connected ? TFT_GREEN : TFT_RED);
 
     // The Mode.
-    M5.Lcd.setTextColor(TFT_LIGHTGRAY);
-    M5.Lcd.setCursor(184, 204);
-    M5.Lcd.print("Mode:" + ( evse_connected ? mode : "-"));
+    M5.Display.setTextColor(TFT_LIGHTGRAY);
+    M5.Display.setCursor(184, 204);
+    M5.Display.print("Mode:" + (evse_connected ? mode : "-"));
 
     // Show Error.
-    M5.Lcd.setTextColor(error == "" || error == "None" ? TFT_DARKGRAY : TFT_RED);
-    M5.Lcd.setCursor(16, 224);
-    M5.Lcd.print("Error: " + error);
+    M5.Display.setTextColor(error == "" || error == "None" ? TFT_DARKGRAY : TFT_RED);
+    M5.Display.setCursor(16, 224);
+    M5.Display.print("Error: " + error);
 
     // Rest text color.
-    M5.Lcd.setTextColor(TEXT_COLOR);
+    M5.Display.setTextColor(TEXT_COLOR);
 }
 
 
@@ -720,7 +764,7 @@ void drawEVSEScreen() {
             time_t mtime = 0;
             const char *data = mg_unpack(path, &size, &mtime);
             if (data != nullptr) {
-                if (!M5.Display.drawPng((uint8_t*) data, size, 32, 0)) {
+                if (!M5.Display.drawPng((uint8_t *) data, size, 32, 0)) {
                     M5.Display.setTextColor(TFT_RED);
                     M5.Display.setCursor(16, 10);
                     M5.Display.println("Failed to decode PNG");
@@ -782,11 +826,11 @@ void sendModeChange(const String &newMode) {
 
 // ---- Timeout Message ----
 void showTimeoutMessage() {
-    M5.Lcd.clear(TFT_BLACK);
-    M5.Lcd.setCursor(10, 40);
-    M5.Lcd.println("Connection Timeout");
-    M5.Lcd.println("1. Retry");
-    M5.Lcd.println("2. Settings");
+    M5.Display.clear(TFT_BLACK);
+    M5.Display.setCursor(10, 40);
+    M5.Display.println("Connection Timeout");
+    M5.Display.println("1. Retry");
+    M5.Display.println("2. Settings");
 
     while (true) {
         M5.Touch.update(0);
@@ -807,28 +851,28 @@ void showTimeoutMessage() {
 // ---- WiFi Connecting Animation ----
 void showWiFiConnectingAnimation() {
     for (int i = 0; i < 3; ++i) {
-        M5.Lcd.setCursor(10, 220);
-        M5.Lcd.print("Connecting to WiFi");
+        M5.Display.setCursor(10, 220);
+        M5.Display.print("Connecting to WiFi");
         for (int j = 0; j < 3; ++j) {
-            M5.Lcd.print(".");
+            M5.Display.print(".");
             delay(300);
         }
-        M5.Lcd.fillRect(10, 220, 200, 20, TFT_BLACK);
+        M5.Display.fillRect(10, 220, 200, 20, TFT_BLACK);
     }
 }
 
 void stopWiFiConnectingAnimation() {
-    M5.Lcd.fillRect(10, 220, 200, 20, TFT_BLACK);
+    M5.Display.fillRect(10, 220, 200, 20, TFT_BLACK);
 }
 
 
 // ---- Show WiFi Retry Menu ----
 void showWiFiRetryMenu() {
-    M5.Lcd.clear(TFT_BLACK);
-    M5.Lcd.setCursor(10, 40);
-    M5.Lcd.println("WiFi Connection Failed");
-    M5.Lcd.println("1. Retry");
-    M5.Lcd.println("2. Settings");
+    M5.Display.clear(TFT_BLACK);
+    M5.Display.setCursor(10, 40);
+    M5.Display.println("WiFi Connection Failed");
+    M5.Display.println("1. Retry");
+    M5.Display.println("2. Settings");
 
     while (true) {
         M5.Touch.update(0);
@@ -857,9 +901,9 @@ void showSettingsMenu() {
 
 
 void configureSetting(const char *key, String &value) {
-    M5.Lcd.clear(TFT_BLACK);
-    M5.Lcd.setCursor(10, 40);
-    M5.Lcd.printf("Change %s:", key);
+    M5.Display.clear(TFT_BLACK);
+    M5.Display.setCursor(10, 40);
+    M5.Display.printf("Change %s:", key);
 
     String result = showVirtualKeyboard();
     if (!result.isEmpty()) {
