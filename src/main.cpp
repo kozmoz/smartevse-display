@@ -58,7 +58,7 @@ IPAddress subnet(255, 255, 255, 0);
 
 // ---- Configuration ----
 Preferences preferences;
-String smartevseHost;
+String smartEvseHost;
 
 // EVSE connected
 bool evseConnected = false;
@@ -101,9 +101,9 @@ DNSServer dnsServer;
 // ---- Function Prototypes ----
 void sendModeChange(const String &newMode);
 
-void drawUI();
+void drawStatus();
 
-void fetchSmartEVSEData(void *param);
+void fetchSmartEVSEData();
 
 void drawSmartEVSEDisplay();
 
@@ -116,7 +116,7 @@ bool connectToWiFi(String ssid, String password);
 // Button objects
 LGFX_Button solarButton;
 LGFX_Button smartButton;
-LGFX_Button smartEVSEConfigButton;
+LGFX_Button configButton;
 
 /**
  * Scans for available WiFi networks and retrieves their details.
@@ -528,36 +528,43 @@ void initButtons() {
     smartButton.initButton(&M5.Display, SMART_BUTTON_X + BUTTON_WIDTH / 2, BUTTON_Y + BUTTON_HEIGHT / 2,
                            BUTTON_WIDTH, BUTTON_HEIGHT, BACKGROUND_COLOR, 0x07E0, TFT_BLACK, "Smart", 3);
 
-    smartEVSEConfigButton.initButton(&M5.Display, SCREEN_WIDTH / 2, BUTTON_Y + BUTTON_HEIGHT / 2,
-                                     SCREEN_WIDTH - (2 * SOLAR_BUTTON_X), BUTTON_HEIGHT, BACKGROUND_COLOR, 0xF680,
-                                     TFT_BLACK,
-                                     "Select EVSE", 3);
+    configButton.initButton(&M5.Display, SCREEN_WIDTH / 2, BUTTON_Y + BUTTON_HEIGHT / 2,
+                            SCREEN_WIDTH - (2 * SOLAR_BUTTON_X), BUTTON_HEIGHT, BACKGROUND_COLOR, 0xF680,
+                            TFT_BLACK,
+                            "Select EVSE", 3);
 }
 
-void drawSmartEVSESolarSmartButton() {
-    if (evseConnected) {
-        // Clear buttons.
+void drawSolarButton(const bool pressed, const bool clear = false) {
+    // Todo: Only clear when needed, that prevents flickering.
+    if (clear) {
+        // Clear the button area.
         M5.Display.fillRect(0, BUTTON_Y, 420, BUTTON_HEIGHT, BACKGROUND_COLOR);
-
-        solarButton.setFillColor(0xF680);
-        smartButton.setFillColor(0x07E0);
-        // White border for active
-        solarButton.setOutlineColor((mode == "Solar") ? ACTIVE_BORDER_COLOR : BACKGROUND_COLOR);
-        smartButton.setOutlineColor((mode == "Smart") ? ACTIVE_BORDER_COLOR : BACKGROUND_COLOR);
-        solarButton.drawButton();
-        smartButton.drawButton();
     }
+    solarButton.setFillColor(0xF680);
+    solarButton.setOutlineColor(mode == "Solar" ? ACTIVE_BORDER_COLOR : BACKGROUND_COLOR);
+    solarButton.drawButton(pressed);
 }
 
-void drawSmartEVSEConfigButton() {
-    if (!evseConnected) {
+void drawSmartButton(const bool pressed, const bool clear = false) {
+    // Todo: Only clear when needed, that prevents flickering.
+    if (clear) {
+        // Clear the button area.
+        M5.Display.fillRect(0, BUTTON_Y, 420, BUTTON_HEIGHT, BACKGROUND_COLOR);
+    }
+    smartButton.setFillColor(0x07E0);
+    smartButton.setOutlineColor(mode == "Smart" ? ACTIVE_BORDER_COLOR : BACKGROUND_COLOR);
+    smartButton.drawButton(pressed);
+}
+
+void drawSmartEVSEConfigButton(bool clear = false) {
+    if (clear) {
         // Clear buttons.
         M5.Display.fillRect(0, BUTTON_Y, 420, BUTTON_HEIGHT, BACKGROUND_COLOR);
-
-        smartEVSEConfigButton.setFillColor(TFT_RED);
-        smartEVSEConfigButton.setOutlineColor(ACTIVE_BORDER_COLOR);
-        smartEVSEConfigButton.drawButton();
     }
+
+    configButton.setFillColor(TFT_RED);
+    configButton.setOutlineColor(ACTIVE_BORDER_COLOR);
+    configButton.drawButton();
 }
 
 void playBeep() {
@@ -592,18 +599,31 @@ void setup() {
     M5.Speaker.setVolume(200); // Max volume for beep
 
     preferences.begin("se-display", false);
+    // Returns an empty String by default if the key doesn't exist.
     const String ssid = preferences.getString("ssid");
     const String password = preferences.getString("password");
+    // Todo: enable smartevse_host
     // smartevse_host = preferences.getString("smartevse_host");
-    smartevseHost = "192.168.1.92";
+    smartEvseHost = "192.168.1.92";
 
     Serial.printf("==== ssid from preferences: %s\n", ssid != nullptr ? ssid.c_str() : "NULL");
     Serial.printf("==== password from preferences: %s\n", password != nullptr ? password.c_str() : "NULL");
     Serial.printf("==== smartevse_host from preferences: %s\n",
-                  smartevseHost != nullptr ? smartevseHost.c_str() : "NULL");
+                  smartEvseHost != nullptr ? smartEvseHost.c_str() : "NULL");
 
-    if (ssid.length() > 0) {
-        wifiConnected = connectToWiFi(ssid, password != nullptr ? password : "");
+    // Connect to WiFi; try three times max.
+    if (!ssid.isEmpty()) {
+        int retries = 3;
+        while (retries > 0) {
+            wifiConnected = connectToWiFi(ssid, password != nullptr ? password : "");
+            if (wifiConnected) {
+                break;
+            }
+            retries--;
+            if (retries > 0) {
+                delay(1000);
+            }
+        }
     }
 
     if (!wifiConnected) {
@@ -625,25 +645,60 @@ void setup() {
     startWebserver();
 
     initButtons();
+
+    if (wifiConnected) {
+        fetchSmartEVSEData();
+        if (evseConnected) {
+            solarButton.drawButton(false);
+            smartButton.drawButton(false);
+        } else {
+            configButton.drawButton(false);
+        }
+    }
 }
 
 static unsigned long lastCheck1S = 0;
-static unsigned long lastCheck2S = 0;
+static unsigned long lastCheck3S = 0;
 
 
 // Todo: Move drawSmartEVSEDisplay() to FreeRTOS task
 
+void handleTouchInput(const bool touchDetected) {
+    if (!touchDetected) {
+        solarButton.press(false);
+        smartButton.press(false);
+        configButton.press(false);
+        return;
+    }
+
+    const auto touchPoint = M5.Touch.getDetail(0);
+    const int16_t x = touchPoint.x;
+    const int16_t y = touchPoint.y;
+
+    if (evseConnected) {
+        // SmartEVSE connected.
+        solarButton.press(solarButton.contains(x, y));
+        smartButton.press(smartButton.contains(x, y));
+        configButton.press(false);
+    } else {
+        // No SmartEVSE connected.
+        solarButton.press(false);
+        smartButton.press(false);
+        configButton.press(configButton.contains(x, y));
+    }
+}
+
 // ---- Main Loop ----
 void loop() {
-    // Update touch and button states
+    // Update touch and button states.
     M5.update();
 
     // Reboot device?
     if (reboot) {
         Serial.printf("==== Rebooting...\n");
+        // Some delay to finish possible http response.
         delay(2000);
         esp_restart();
-        reboot = false;
     }
 
     // Must be called frequently.
@@ -653,40 +708,27 @@ void loop() {
 
     if (wifiConnected) {
         // Check for touch events
-        if (M5.Touch.getCount() > 0) {
-            const auto touchPoint = M5.Touch.getDetail(0);
-            const int16_t x = touchPoint.x;
-            const int16_t y = touchPoint.y;
+        const bool touchDetected = M5.Touch.getCount() > 0;
+        handleTouchInput(touchDetected);
 
-            // Check Solar button touch.
-            if (evseConnected && mode != "Solar" && solarButton.contains(x, y)) {
-                mode = "Solar";
-                playBeep();
-                drawSmartEVSESolarSmartButton();
-                drawUI();
-                sendModeChange("2");
-                solarButton.press(true);
-                smartButton.press(false);
-                smartEVSEConfigButton.press(false);
-            }
-            // Check Smart button touch.
-            else if (evseConnected && mode != "Smart" && smartButton.contains(x, y)) {
-                mode = "Smart";
-                playBeep();
-                drawSmartEVSESolarSmartButton();
-                drawUI();
-                sendModeChange("3");
-                solarButton.press(false);
-                smartButton.press(true);
-                smartEVSEConfigButton.press(false);
-            } else if (!evseConnected && smartEVSEConfigButton.contains(x, y)) {
-                showConfig = true;
-                playBeep();
-                solarButton.press(false);
-                smartButton.press(false);
-                smartEVSEConfigButton.press(true);
-                drawSettingsMenu();
-            }
+        // Draw and update buttons.
+        if (solarButton.justPressed()) {
+            Serial.printf("==== Loop - solarButton.justPressed()\n");
+            playBeep();
+            mode = "Solar";
+            drawSolarButton(true);
+        }
+        if (smartButton.justPressed()) {
+            Serial.printf("==== Loop - smartButton.justPressed()\n");
+            playBeep();
+            mode = "Smart";
+            drawSmartButton(true);
+        }
+        if (solarButton.justReleased() || smartButton.justReleased()) {
+            Serial.printf("==== Loop - solar- or smartButton.justReleased()\n");
+            // Update the active state of both buttons.
+            drawSolarButton(false);
+            drawSmartButton(false);
         }
 
         // Update every second.
@@ -696,18 +738,17 @@ void loop() {
             drawSmartEVSEDisplay();
         }
 
-        if (false && millis() - lastCheck2S >= 3000) {
-            lastCheck2S = millis();
+        if (false && millis() - lastCheck3S >= 3000) {
+            lastCheck3S = millis();
             Serial.printf("==== Loop 3s - Fetching data...\n");
-            fetchSmartEVSEData(nullptr);
+
+            // Todo:sendModeChange("2");
+
+            fetchSmartEVSEData();
             // xTaskCreatePinnedToCore(fetchSmartEVSEData, "NetTask", 8192, NULL, 1, NULL, 1);
-            drawSmartEVSESolarSmartButton();
-            drawSmartEVSEConfigButton();
-            drawUI();
+            drawStatus();
         }
     }
-
-    delay(50);
 }
 #endif // UNIT_TEST
 
@@ -717,7 +758,7 @@ bool connectToWiFi(String ssid, String password) {
     WiFi.begin(ssid.c_str(), password.c_str());
     int attempts = 0;
     // showWiFiConnectingAnimation();
-    while (WiFi.status() != WL_CONNECTED && attempts < 5) {
+    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
         delay(500);
         attempts++;
         // M5.Display.setCursor(10, 220);
@@ -746,23 +787,24 @@ void showTimeoutMessage();
  * device is unreachable or the network is not connected, it updates
  * the state to indicate disconnection.
  */
-void fetchSmartEVSEData(void *param) {
+void fetchSmartEVSEData() {
     if (!wifiConnected) {
         evseConnected = false;
         return;
     }
-    if (!smartevseHost) {
+    if (!smartEvseHost) {
         evseConnected = false;
         error = "No SmartEVSE host";
         return;
     }
 
     HTTPClient http;
-    String url = "http://" + smartevseHost + "/settings";
+    const String url = "http://" + smartEvseHost + "/settings";
     http.begin(url);
     http.setTimeout(1500);
 
     const int httpResponseCode = http.GET();
+    Serial.printf("==== fetchSmartEVSEData() httpResponseCode: %d\n", httpResponseCode);
 
     if (httpResponseCode < 300) {
         String payload = http.getString();
@@ -789,17 +831,17 @@ void fetchSmartEVSEData(void *param) {
         } else {
             evseConnected = false;
             error = "SmartEVSE Failed";
+            Serial.printf("==== fetchSmartEVSEData() paarsing JSON failed\n");
         }
     } else {
         evseConnected = false;
         error = "SmartEVSE Timeout";
     }
     http.end();
-    vTaskDelete(nullptr); // End this task
 }
 
 
-void drawUI() {
+void drawStatus() {
     // M5.Display.fillScreen(TFT_BLACK);
 
     // Reset status and text area.
@@ -838,14 +880,17 @@ void drawUI() {
 }
 
 
-// ---- Draw EVSE Screen (Live) ----
+/**
+ * Draw the SmartEVSE LCD screen.
+ * If not connected to a network, do nothing.
+ */
 void drawSmartEVSEDisplay() {
     if (!wifiConnected) {
         return;
     }
 
     if (smartEvseHttpClient == nullptr) {
-        const String url = "http://" + smartevseHost + "/lcd";
+        const String url = "http://" + smartEvseHost + "/lcd";
         smartEvseHttpClient = new HTTPClient();
         smartEvseHttpClient->begin(url);
         smartEvseHttpClient->setTimeout(750);
@@ -902,7 +947,7 @@ void sendModeChange(const String &newMode) {
     if (wifiConnected) {
         HTTPClient http;
         // String url = "http://" + evse_ip + "/settings?mode=" + newMode + "&starttime=0&override_current=0&repeat=0";
-        String url = "http://" + smartevseHost + "/settings?mode=" + newMode +
+        String url = "http://" + smartEvseHost + "/settings?mode=" + newMode +
                      "&override_current=0&starttime=2025-05-15T00:27&stoptime=2025-05-15T00:27&repeat=0";
 
         http.begin(url);
@@ -987,11 +1032,11 @@ void drawSettingsMenu() {
                     // Clear the screen again.
                     M5.Display.fillScreen(BACKGROUND_COLOR);
                     // Store the selected host.
-                    smartevseHost = hosts[i].ip;
-                    preferences.putString("smartevse_host", smartevseHost);
+                    smartEvseHost = hosts[i].ip;
+                    preferences.putString("smartevse_host", smartEvseHost);
                     showConfig = false;
                     // Try to connect to the device.
-                    fetchSmartEVSEData(nullptr);
+                    fetchSmartEVSEData();
                     return;
                 }
             }
