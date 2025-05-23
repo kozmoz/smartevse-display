@@ -12,17 +12,38 @@ const ELM_DIV_ERROR_MESSAGE = document.getElementById('error');
 
 // Form validation.
 ELM_FORM_NETWORK.onsubmit = (event) => {
-    if (ELM_INPUT_NETWORK_PASSWORD.value.length === 0) {
-        ELM_DIV_ERROR_MESSAGE.textContent = "Password is a required field.";
-        ELM_DIV_ERROR_MESSAGE.style.display = 'block';
-        event.preventDefault();
-        return;
-    }
+
+    // We cancel the default form POST behaviour.
+    // Data will be sent in JSON POST request.
+    event.preventDefault();
+
     if (ELM_INPUT_NETWORK_SSID.value.length === 0) {
         ELM_DIV_ERROR_MESSAGE.textContent = "No network selected.";
         ELM_DIV_ERROR_MESSAGE.style.display = 'block';
-        event.preventDefault();
+        return;
     }
+
+
+    // Send data as JSON POST to the server.
+    fetch('/', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                ssid: ELM_INPUT_NETWORK_SSID.value,
+                password: ELM_INPUT_NETWORK_PASSWORD.value || ''
+            })
+        }
+    ).then(response => {
+        if (!response.ok) {
+            ELM_DIV_ERROR_MESSAGE.textContent = "Error saving WiFi settings.";
+            ELM_DIV_ERROR_MESSAGE.style.display = 'block';
+            return;
+        }
+        // Forward browser to success page.
+        window.location.href = '/success.html?reboot=true';
+    });
 }
 
 let selectedNetwork = null;

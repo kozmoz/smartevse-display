@@ -1,4 +1,5 @@
 #include <M5Unified.h>
+#include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
@@ -9,6 +10,8 @@
 #include "esp_http_server.h"
 #include <ctime>
 #include <ESPmDNS.h>
+#include <qrcode.h>
+#include <DNSServer.h>
 
 // The included functions are in a C file.
 extern "C" {
@@ -26,7 +29,7 @@ struct packed_file {
 extern const struct packed_file packed_files[];
 }
 
-#define WIFI_SSID "M5Stack-Config"
+#define WIFI_SSID "SmartEVSE_Display"
 #define WIFI_PASS "12345678"
 #define MAX_SSID_LEN 32
 #define MAX_PASS_LEN 64
@@ -50,11 +53,12 @@ extern const struct packed_file packed_files[];
 const String DEVICE_NAME = "smartevse-display";
 const String AP_HOSTNAME = DEVICE_NAME + "-" + String((uint32_t) ESP.getEfuseMac() & 0xffff, 10);
 
+IPAddress apIP(192, 168, 4, 1); // Local IP of the ESP32
+IPAddress subnet(255, 255, 255, 0);
+
 // ---- Configuration ----
 Preferences preferences;
-String ssid = "Juurlink";
-String password = "1122334411";
-String smartevse_host = "192.168.1.92";
+String smartevse_host;
 
 // EVSE connected
 bool evse_connected = false;
@@ -62,6 +66,8 @@ bool evse_connected = false;
 bool wifi_connected = false;
 // Show config (SmartEVSE selection screen).
 bool showConfig = false;
+bool dnsServerRunning = false;
+bool reboot = false;
 
 // Globale variabelen
 String evseState = "Not Connected";
@@ -87,12 +93,14 @@ struct MDNSHost {
     int port;
 };
 
+DNSServer dnsServer;
+
 // ---- Function Prototypes ----
 void sendModeChange(const String &newMode);
 
 void drawUI();
 
-void fetchSmartEVSEData();
+void fetchSmartEVSEData(void *param);
 
 void drawSmartEVSEDisplay();
 
@@ -212,17 +220,19 @@ std::vector<MDNSHost> discoverMDNS() {
     return !hosts.empty() ? hosts : cached_mdns_hosts;
 }
 
-esp_err_t get_handler(httpd_req_t *req) {
+esp_err_t httpGetHandler(httpd_req_t *req) {
+    Serial.printf("==== Process GET request uri: %s\n", req->uri);
+
     if (strcmp(req->uri, "/api/wifi") == 0) {
         auto networks = scanWifiNetworks();
         JsonDocument doc;
         JsonArray array = doc.to<JsonArray>();
 
-        for (size_t i = 0; i < networks.size(); i++) {
-            JsonObject network = array.add<JsonObject>();
-            network["ssid"] = networks[i].ssid;
-            network["rssi"] = networks[i].rssi;
-            network["open"] = networks[i].isOpen;
+        for (auto & i : networks) {
+            auto network = array.add<JsonObject>();
+            network["ssid"] = i.ssid;
+            network["rssi"] = i.rssi;
+            network["open"] = i.isOpen;
         }
 
         String json;
@@ -253,7 +263,7 @@ esp_err_t get_handler(httpd_req_t *req) {
 
     size_t size = 0;
     time_t mtime = 0;
-    String uri = String(req->uri);
+    auto uri = String(req->uri);
     if (uri == "/") {
         uri = "/index.html";
     }
@@ -263,9 +273,18 @@ esp_err_t get_handler(httpd_req_t *req) {
 
     if (isCss) {
         contentType = "text/css";
-    }
-    if (isJs) {
+    } else if (isJs) {
         contentType = "application/javascript";
+    }
+
+    // Do we need to reboot the device?
+    if (uri.indexOf("?reboot=true") > -1) {
+        reboot = true;
+    }
+
+    // Strip everything from the URL from "?"
+    if (uri.indexOf("?") > -1) {
+        uri = uri.substring(0, uri.indexOf("?"));
     }
 
     auto path = String("/data" + uri).c_str();
@@ -276,7 +295,6 @@ esp_err_t get_handler(httpd_req_t *req) {
         strftime(timeStr, sizeof(timeStr), "%a, %d %b %Y %H:%M:%S GMT", gmtime(&mtime));
         httpd_resp_set_hdr(req, "Last-Modified", timeStr);
         httpd_resp_send(req, data, static_cast<ssize_t>(size));
-
         return ESP_OK;
     }
 
@@ -287,29 +305,56 @@ esp_err_t get_handler(httpd_req_t *req) {
     return ESP_ERR_NOT_FOUND;
 }
 
-esp_err_t post_handler(httpd_req_t *req) {
+esp_err_t httpPostHandler(httpd_req_t *req) {
+
+    Serial.printf("==== Process POST request uri: %s\n", req->uri);
+
     char buf[128];
-    int ret = httpd_req_recv(req, buf, req->content_len);
+    const int ret = httpd_req_recv(req, buf, req->content_len);
     if (ret <= 0) {
+        Serial.printf("==== Error receiving response\n");
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_send(req, "Error", -1);
         return ESP_FAIL;
     }
+    const auto payload = String(buf, ret);
 
-    char ssid[MAX_SSID_LEN];
-    char password[MAX_PASS_LEN];
+    JsonDocument doc;
+    const DeserializationError jsonError = deserializeJson(doc, payload);
 
-    sscanf(buf, "ssid=%31[^&]&password=%63s", ssid, password);
+    if (!jsonError) {
+        // Extract values from JSON and update global variables.
+        const String ssid = doc["ssid"];
+        const String password = !doc["password"].isNull() ? doc["password"] : String("");
 
-    preferences.putString("ssid", ssid);
-    preferences.putString("password", password);
+        if (ssid == nullptr || ssid.isEmpty()) {
+            Serial.printf("==== ssid is empty\n");
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "text/plain");
+            httpd_resp_send(req, "Error", -1);
+            return ESP_FAIL;
+        }
 
-    httpd_resp_set_status(req, "201 Created");
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_set_hdr(req, "Location", "/success.html");
-    httpd_resp_send(req, "<script>window.location='/success.html'</script>", -1);
-    return ESP_OK;
+        preferences.putString("ssid", ssid);
+        preferences.putString("password", password );
+
+        Serial.printf("==== ssid to preferences: %s\n", ssid.c_str());
+        Serial.printf("==== password to preferences: %s\n", password.c_str());
+
+        httpd_resp_set_status(req, "201 Created");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_send(req, "OK", -1);
+        return ESP_OK;
+    }
+    Serial.printf("==== Error parsing JSON: %s\n", jsonError.c_str());
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "Error", -1);
+    return ESP_FAIL;
 }
 
-void start_webserver() {
+void startWebserver() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     httpd_handle_t server = nullptr;
     // Add wildcard support.
@@ -320,32 +365,94 @@ void start_webserver() {
     httpd_uri_t get_uri = {
         .uri = "*",
         .method = HTTP_GET,
-        .handler = get_handler
+        .handler = httpGetHandler
     };
     httpd_register_uri_handler(server, &get_uri);
 
     httpd_uri_t post_uri = {
         .uri = "/",
         .method = HTTP_POST,
-        .handler = post_handler
+        .handler = httpPostHandler
     };
     httpd_register_uri_handler(server, &post_uri);
 }
 
+void drawQRCode(const char *url, const int scale = 4, const int y = -1, const int x = -1) {
+    QRCode qrcode;
+
+    // QR code buffer, version 3 = 29x29 matrix.
+    uint8_t qrcodeData[qrcode_getBufferSize(3)];
+
+    // Initialize the QR code
+    qrcode_initText(&qrcode, qrcodeData, 3, ECC_LOW, url);
+    const int qrSize = qrcode.size;
+    const int scaledSize = qrSize * scale;
+
+    // If x and y are not specified (-1), center the QR code.
+    const int xOffset = (x == -1) ? (M5.Display.width() - scaledSize) / 2 : x;
+    const int yOffset = (y == -1) ? (M5.Display.height() - scaledSize) / 2 : y;
+
+    // Draw the QR code
+    for (int row = 0; row < qrSize; row++) {
+        for (int col = 0; col < qrSize; col++) {
+            int color = qrcode_getModule(&qrcode, col, row) ? BLACK : WHITE;
+            M5.Display.fillRect(xOffset + col * scale, yOffset + row * scale, scale, scale, color);
+        }
+    }
+}
+
+String generateWiFiUrl(const char *ssid, const char *password, const bool hidden = false) {
+    String url = "WIFI:";
+    url += "T:WPA;"; // Encryption type (Update to "T:nopass;" if open network).
+    url += "S:" + String(ssid) + ";";
+    url += "P:" + String(password) + ";";
+    if (hidden) {
+        url += "H:true;";
+    }
+    url += ";";
+    return url;
+}
+
 void start_ap_mode() {
-    M5.begin();
-    M5.Display.clear();
+    M5.Display.clearDisplay();
+    M5.Display.setCursor(0, 0);
+    M5.Display.setTextColor(TFT_WHITE);
     M5.Display.print("Starting AP Mode...\n\n");
 
     WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(apIP, apIP, subnet);
     WiFi.softAP(WIFI_SSID, WIFI_PASS);
 
-    // ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    // ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
-    // ESP_ERROR_CHECK(esp_wifi_start());
+    // DNS redirect: capture all domains to the ESP32's IP
+    const bool started = dnsServer.start(53, "*", apIP);
+    Serial.printf("==== DNS Server start: %s\n", started ? "success" : "failed");
+    dnsServerRunning = true;
 
-    auto local_ip = WiFi.softAPIP();
-    M5.Display.print("AP Mode Active\nSSID: " WIFI_SSID "\nPassword: " WIFI_PASS "\nIP: " + local_ip.toString());
+    int y = 0;
+    M5.Display.clearDisplay();
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.setCursor(0, y);
+    M5.Display.print("Access Point Active");
+    y += 30;
+    M5.Display.setCursor(0, y);
+    M5.Display.print("1. Connect to WiFi");
+    y += 20;
+    M5.Display.setCursor(0, y);
+    M5.Display.print("   SSID: " WIFI_SSID "\n"
+        "   Pass: " WIFI_PASS "\n");
+    y += 36;
+    M5.Display.setCursor(0, y);
+    M5.Display.print("2. Open in browser");
+    y += 20;
+    M5.Display.setCursor(0, y);
+    M5.Display.print("   " + apIP.toString());
+
+    const String url = generateWiFiUrl(WIFI_SSID, WIFI_PASS);
+    const int qrX = M5.Display.width() - 120;
+    const int qrY = M5.Display.height() - 120;
+    // auto url2 = ("http://" + local_ip.toString()).c_str;
+    drawQRCode(url.c_str(), 4, qrY, qrX);
 }
 
 void displayMonochromeBitmap(WiFiClient *stream, int width, int height, int x, int y,
@@ -415,14 +522,14 @@ void displayMonochromeBitmap(WiFiClient *stream, int width, int height, int x, i
  */
 void initButtons() {
     solarButton.initButton(&M5.Display, SOLAR_BUTTON_X + BUTTON_WIDTH / 2, BUTTON_Y + BUTTON_HEIGHT / 2,
-                       BUTTON_WIDTH, BUTTON_HEIGHT, BACKGROUND_COLOR, 0xF680, TFT_BLACK, "Solar", 3);
+                           BUTTON_WIDTH, BUTTON_HEIGHT, BACKGROUND_COLOR, 0xF680, TFT_BLACK, "Solar", 3);
     smartButton.initButton(&M5.Display, SMART_BUTTON_X + BUTTON_WIDTH / 2, BUTTON_Y + BUTTON_HEIGHT / 2,
                            BUTTON_WIDTH, BUTTON_HEIGHT, BACKGROUND_COLOR, 0x07E0, TFT_BLACK, "Smart", 3);
 
-    smartEVSEConfigButton.initButton(&M5.Display, SCREEN_WIDTH/2, BUTTON_Y + BUTTON_HEIGHT / 2,
-                                     SCREEN_WIDTH - (2*SOLAR_BUTTON_X), BUTTON_HEIGHT, BACKGROUND_COLOR, 0xF680, TFT_BLACK,
+    smartEVSEConfigButton.initButton(&M5.Display, SCREEN_WIDTH / 2, BUTTON_Y + BUTTON_HEIGHT / 2,
+                                     SCREEN_WIDTH - (2 * SOLAR_BUTTON_X), BUTTON_HEIGHT, BACKGROUND_COLOR, 0xF680,
+                                     TFT_BLACK,
                                      "Select EVSE", 3);
-
 }
 
 void drawSmartEVSESolarSmartButton() {
@@ -459,6 +566,8 @@ void playBeep() {
 
 // ---- Setup ----
 void setup() {
+    Serial.begin(115200);
+
     // Initialize M5Stack Tough
     auto cfg = M5.config();
     cfg.external_spk = true; // Enable the external speaker if available
@@ -480,12 +589,19 @@ void setup() {
     M5.Speaker.begin();
     M5.Speaker.setVolume(200); // Max volume for beep
 
-    preferences.begin("smartevse-display", false);
-    ssid = preferences.getString("ssid", ssid);
-    password = preferences.getString("password", password);
-    smartevse_host = preferences.getString("smartevse_host", smartevse_host);
+    preferences.begin("se-display", false);
+    const String ssid = preferences.getString("ssid");
+    const String password = preferences.getString("password");
+    smartevse_host = preferences.getString("smartevse_host");
 
-    wifi_connected = connectToWiFi(ssid, password);
+    Serial.printf("==== ssid from preferences: %s\n", ssid != nullptr ? ssid.c_str() : "NULL");
+    Serial.printf("==== password from preferences: %s\n", password != nullptr ? password.c_str() : "NULL");
+    Serial.printf("==== smartevse_host from preferences: %s\n",
+                  smartevse_host != nullptr ? smartevse_host.c_str() : "NULL");
+
+    if (ssid.length() > 0) {
+        wifi_connected = connectToWiFi(ssid, password != nullptr ? password : "");
+    }
 
     if (!wifi_connected) {
         start_ap_mode();
@@ -503,10 +619,7 @@ void setup() {
         MDNS.addService("http", "tcp", 80); // announce Web server
     }
 
-    start_webserver();
-
-    // Reset initializing text.
-    M5.Display.fillRect(16, 204, 340 - 16, 20, TFT_BLACK);
+    startWebserver();
 
     initButtons();
 }
@@ -515,9 +628,25 @@ static unsigned long lastCheck1S = 0;
 static unsigned long lastCheck2S = 0;
 
 
+// Todo: Move drawSmartEVSEDisplay() to FreeRTOS task
+
 // ---- Main Loop ----
 void loop() {
-    M5.update(); // Update touch and button states
+    // Update touch and button states
+    M5.update();
+
+    // Reboot device?
+    if (reboot) {
+        Serial.printf("==== Rebooting...\n");
+        delay(2000);
+        esp_restart();
+        reboot = false;
+    }
+
+    // Must be called frequently.
+    if (dnsServerRunning) {
+        dnsServer.processNextRequest();
+    }
 
     if (wifi_connected) {
         // Check for touch events
@@ -565,7 +694,8 @@ void loop() {
 
         if (millis() - lastCheck2S >= 2000) {
             lastCheck2S = millis();
-            fetchSmartEVSEData();
+            // fetchSmartEVSEData();
+            xTaskCreatePinnedToCore(fetchSmartEVSEData, "NetTask", 8192, NULL, 1, NULL, 1);
             drawSmartEVSESolarSmartButton();
             drawSmartEVSEConfigButton();
             drawUI();
@@ -611,7 +741,7 @@ void showTimeoutMessage();
  * device is unreachable or the network is not connected, it updates
  * the state to indicate disconnection.
  */
-void fetchSmartEVSEData() {
+void fetchSmartEVSEData(void *param) {
     if (!wifi_connected) {
         evse_connected = false;
         return;
@@ -627,7 +757,7 @@ void fetchSmartEVSEData() {
     http.begin(url);
     http.setTimeout(5000);
 
-    int httpResponseCode = http.GET();
+    const int httpResponseCode = http.GET();
 
     if (httpResponseCode < 300) {
         String payload = http.getString();
@@ -660,16 +790,19 @@ void fetchSmartEVSEData() {
         error = "SmartEVSE Timeout";
     }
     http.end();
+    vTaskDelete(nullptr); // End this task
 }
 
 
 void drawUI() {
     // M5.Display.fillScreen(TFT_BLACK);
 
+    // Reset status and text area.
+    M5.Display.fillRect(0, 204, M5.Display.width(), 20, TFT_BLACK);
     // Reset error area.
-    M5.Display.fillRect(0, 224, 340, 20, TFT_BLACK);
+    M5.Display.fillRect(0, 224, M5.Display.width(), 20, TFT_BLACK);
     // Reset mode.
-    M5.Display.fillRect(184, 204, 340 - 184, 20, TFT_BLACK);
+    // M5.Display.fillRect(184, 204, 340 - 184, 20, TFT_BLACK);
 
     M5.Display.setTextSize(2);
 
@@ -825,7 +958,7 @@ void drawSettingsMenu() {
             const int16_t touchY = touchPoint.y;
 
             for (size_t i = 0; i < hosts.size() && i < 4; i++) {
-                if (touchY >= y + i*44 && touchY < y + (i+1)*44) {
+                if (touchY >= y + i * 44 && touchY < y + (i + 1) * 44) {
                     // Clear the screen again.
                     M5.Display.fillScreen(BACKGROUND_COLOR);
                     // Store the selected host.
@@ -833,7 +966,7 @@ void drawSettingsMenu() {
                     preferences.putString("smartevse_host", smartevse_host);
                     showConfig = false;
                     // Try to connect to the device.
-                    fetchSmartEVSEData();
+                    fetchSmartEVSEData(nullptr);
                     return;
                 }
             }
@@ -841,7 +974,6 @@ void drawSettingsMenu() {
         delay(50);
     }
 }
-
 
 
 // ---- IP Address Validation ----
