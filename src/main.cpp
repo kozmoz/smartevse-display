@@ -565,8 +565,14 @@ void drawConfigButton(const bool pressed = false, const bool clear = false) {
     configButton.drawButton(pressed);
 }
 
-void playBeep() {
-    M5.Speaker.tone(1000, 50); // 4000 Hz for 100 ms
+/**
+ * Plays a beep sound using the speaker with specified frequency and duration.
+ *
+ * @param frequency The frequency of the tone in Hz. Defaults to 1000 Hz.
+ * @param duration The duration of the tone in milliseconds. Defaults to 50 ms.
+ */
+void playBeep(const float frequency = 1000, const int duration = 50) {
+    M5.Speaker.tone(frequency, duration);
 }
 
 #ifndef UNIT_TEST
@@ -715,13 +721,13 @@ void loop() {
         // Draw and update buttons.
         if (solarButton.justPressed()) {
             Serial.printf("==== Loop - solarButton.justPressed()\n");
-            playBeep();
+            playBeep(1000);
             mode = "Solar";
             drawSolarButton(true);
         }
         if (smartButton.justPressed()) {
             Serial.printf("==== Loop - smartButton.justPressed()\n");
-            playBeep();
+            playBeep(2000);
             mode = "Smart";
             drawSmartButton(true);
         }
