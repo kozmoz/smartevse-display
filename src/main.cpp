@@ -9,6 +9,7 @@
 #include "esp_wifi.h"
 #include "esp_http_server.h"
 #include <ctime>
+#include <utility>
 #include <ESPmDNS.h>
 #include <qrcode.h>
 #include <DNSServer.h>
@@ -51,7 +52,8 @@ extern const struct packed_file packed_files[];
 #define BOLD_FONT &fonts::FreeSansBold12pt7b
 
 const String DEVICE_NAME = "smartevse-display";
-const String AP_HOSTNAME = DEVICE_NAME + "-" + String((uint32_t) ESP.getEfuseMac() & 0xffff, 10);
+// AP_HOSTNAME will be defined in the setup().
+String AP_HOSTNAME;
 
 IPAddress apIP(192, 168, 4, 1); // Local IP of the ESP32
 IPAddress subnet(255, 255, 255, 0);
@@ -79,12 +81,7 @@ String error = "None";
 
 HTTPClient *smartEvseHttpClient = nullptr;
 
-// ---- UI Elements ----
-M5Canvas canvas(&M5.Display);
-const int SCREEN_WIDTH = 320;
-const int SCREEN_HEIGHT = 240;
-
-struct WifiNetwork {
+struct WifiNetwork { // NOLINT(*-pro-type-member-init)
     String ssid;
     int rssi;
     bool isOpen;
@@ -92,6 +89,7 @@ struct WifiNetwork {
 
 struct MDNSHost {
     String host;
+    String serial;
     String ip;
     int port;
 };
@@ -109,9 +107,7 @@ void drawSmartEVSEDisplay();
 
 void drawSettingsMenu();
 
-bool isValidIP(const String &ip);
-
-bool connectToWiFi(String ssid, String password);
+bool connectToWiFi(const String &ssid, const String &password);
 
 // Button objects
 LGFX_Button solarButton;
@@ -127,7 +123,7 @@ LGFX_Button configButton;
  */
 static std::vector<WifiNetwork> cached_networks;
 static unsigned long last_scan_time = 0;
-const unsigned long SCAN_INTERVAL = 30000; // 10 seconds
+constexpr unsigned long SCAN_INTERVAL = 30000;
 
 std::vector<WifiNetwork> scanWifiNetworks() {
     unsigned long current_time = millis();
@@ -175,7 +171,7 @@ std::vector<WifiNetwork> scanWifiNetworks() {
 
 static std::vector<MDNSHost> cached_mdns_hosts;
 static unsigned long last_mdns_query = 0;
-const unsigned long MDNS_QUERY_INTERVAL = 30000; // 10 seconds
+constexpr unsigned long MDNS_QUERY_INTERVAL = 30000;
 
 std::vector<MDNSHost> discoverMDNS() {
     unsigned long current_time = millis();
@@ -193,7 +189,7 @@ std::vector<MDNSHost> discoverMDNS() {
         if (n > 0) {
             for (int i = 0; i < n; i++) {
                 const String hostname = MDNS.hostname(i);
-                if (!hostname.startsWith("SmartEVSE")) {
+                if (!hostname.startsWith("SmartEVSE-")) {
                     continue;
                 }
                 bool exists = false;
@@ -204,8 +200,10 @@ std::vector<MDNSHost> discoverMDNS() {
                     }
                 }
                 if (!exists) {
+                    const String serial = hostname.substring(hostname.indexOf("-") + 1);
                     hosts.push_back({
                         hostname,
+                        serial,
                         MDNS.IP(i).toString(),
                         MDNS.port(i)
                     });
@@ -251,9 +249,9 @@ esp_err_t httpGetHandler(httpd_req_t *req) {
         JsonDocument doc;
         JsonArray array = doc.to<JsonArray>();
 
-        for (size_t i = 0; i < hosts.size(); i++) {
-            JsonObject network = array.add<JsonObject>();
-            network["host"] = hosts[i].host;
+        for (auto &host: hosts) {
+            auto network = array.add<JsonObject>();
+            network["host"] = host.host;
         }
 
         String json;
@@ -405,7 +403,7 @@ void drawQRCode(const char *url, const int scale = 4, const int y = -1, const in
 
 String generateWiFiUrl(const char *ssid, const char *password, const bool hidden = false) {
     String url = "WIFI:";
-    url += "T:WPA;"; // Encryption type (Update to "T:nopass;" if open network).
+    url += "T:WPA;";
     url += "S:" + String(ssid) + ";";
     url += "P:" + String(password) + ";";
     if (hidden) {
@@ -421,7 +419,7 @@ void start_ap_mode() {
     M5.Display.setTextColor(TFT_WHITE);
     M5.Display.print("Starting AP Mode...\n\n");
 
-    WiFi.mode(WIFI_AP);
+    WiFiClass::mode(WIFI_AP);
     WiFi.softAPConfig(apIP, apIP, subnet);
     WiFi.softAP(WIFI_SSID, WIFI_PASS);
 
@@ -457,8 +455,8 @@ void start_ap_mode() {
     drawQRCode(url.c_str(), 4, qrY, qrX);
 }
 
-void displayMonochromeBitmap(WiFiClient *stream, int width, int height, int x, int y,
-                             int fcolor = TFT_WHITE, int bcolor = TFT_BLACK) {
+void displayMonochromeBitmap(WiFiClient *stream, const int width, const int height, const int x, const int y,
+                             const int foregroundColor = TFT_WHITE, const int backgroundColor = TFT_BLACK) {
     // Skip the bitmap header
     // Todo: The header is off.
     // uint8_t header[62];
@@ -503,7 +501,7 @@ void displayMonochromeBitmap(WiFiClient *stream, int width, int height, int x, i
             // Process each bit in the byte (left to right)
             for (int bit = 0; bit < 8 && col * 8 + bit < width; ++bit) {
                 // Duplicate each pixel horizontally (2 pixels per original pixel)
-                uint16_t pixel = (byte & (1 << bit)) ? fcolor : bcolor;
+                uint16_t pixel = (byte & (1 << bit)) ? foregroundColor : backgroundColor;
                 buffer[bufferIndex++] = pixel;
                 buffer[bufferIndex++] = pixel; // Double horizontally
             }
@@ -528,8 +526,8 @@ void initButtons() {
     smartButton.initButton(&M5.Display, SMART_BUTTON_X + BUTTON_WIDTH / 2, BUTTON_Y + BUTTON_HEIGHT / 2,
                            BUTTON_WIDTH, BUTTON_HEIGHT, BACKGROUND_COLOR, 0x07E0, TFT_BLACK, "Smart", 3);
 
-    configButton.initButton(&M5.Display, SCREEN_WIDTH / 2, BUTTON_Y + BUTTON_HEIGHT / 2,
-                            SCREEN_WIDTH - (2 * SOLAR_BUTTON_X), BUTTON_HEIGHT, BACKGROUND_COLOR, 0xF680,
+    configButton.initButton(&M5.Display, static_cast<int16_t>(M5.Display.width() / 2), BUTTON_Y + BUTTON_HEIGHT / 2,
+                            M5.Display.width() - (2 * SOLAR_BUTTON_X), BUTTON_HEIGHT, BACKGROUND_COLOR, 0xF680,
                             TFT_BLACK,
                             "Select EVSE", 3);
 }
@@ -556,7 +554,7 @@ void drawSmartButton(const bool pressed, const bool clear = false) {
     smartButton.drawButton(pressed);
 }
 
-void drawSmartEVSEConfigButton(bool clear = false) {
+void drawConfigButton(const bool pressed = false, const bool clear = false) {
     if (clear) {
         // Clear buttons.
         M5.Display.fillRect(0, BUTTON_Y, 420, BUTTON_HEIGHT, BACKGROUND_COLOR);
@@ -564,7 +562,7 @@ void drawSmartEVSEConfigButton(bool clear = false) {
 
     configButton.setFillColor(TFT_RED);
     configButton.setOutlineColor(ACTIVE_BORDER_COLOR);
-    configButton.drawButton();
+    configButton.drawButton(pressed);
 }
 
 void playBeep() {
@@ -577,8 +575,11 @@ void playBeep() {
 void setup() {
     Serial.begin(115200);
 
+    // Determine the hostname, it's based on the serial number.
+    AP_HOSTNAME = DEVICE_NAME + "-" + String(static_cast<uint32_t>(ESP.getEfuseMac()) & 0xffff, 10);
+
     // Initialize M5Stack Tough
-    auto cfg = M5.config();
+    auto cfg = m5::M5Unified::config();
     cfg.external_spk = true; // Enable the external speaker if available
     M5.begin(cfg);
 
@@ -649,10 +650,10 @@ void setup() {
     if (wifiConnected) {
         fetchSmartEVSEData();
         if (evseConnected) {
-            solarButton.drawButton(false);
-            smartButton.drawButton(false);
+            drawSolarButton(false);
+            drawSmartButton(false);
         } else {
-            configButton.drawButton(false);
+            drawConfigButton(false);
         }
     }
 }
@@ -738,7 +739,7 @@ void loop() {
             drawSmartEVSEDisplay();
         }
 
-        if (false && millis() - lastCheck3S >= 3000) {
+        if (millis() - lastCheck3S >= 3000) {
             lastCheck3S = millis();
             Serial.printf("==== Loop 3s - Fetching data...\n");
 
@@ -752,28 +753,17 @@ void loop() {
 }
 #endif // UNIT_TEST
 
-bool connectToWiFi(String ssid, String password) {
-    //M5.Display.println("Connecting to WiFi...");
+bool connectToWiFi(const String &ssid, const String &password) {
+    Serial.printf("==== connectToWiFi() ssid: %s\n", ssid.c_str());
 
     WiFi.begin(ssid.c_str(), password.c_str());
     int attempts = 0;
-    // showWiFiConnectingAnimation();
-    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+
+    while (WiFiClass::status() != WL_CONNECTED && attempts < 10) {
         delay(500);
         attempts++;
-        // M5.Display.setCursor(10, 220);
-        // M5.Display.printf("Connecting... Attempt %d", attempts);
     }
-    //stopWiFiConnectingAnimation();
-
-    if (WiFi.status() == WL_CONNECTED) {
-        // M5.Display.setCursor(10, 220);
-        // M5.Display.println("WiFi Connected");
-        return true;
-    }
-    // M5.Display.println("Failed to connect.");
-    // showWiFiRetryMenu();
-    return false;
+    return WiFiClass::status() == WL_CONNECTED;
 }
 
 // ---- Fetch Data from Smart EVSE ----
@@ -831,7 +821,7 @@ void fetchSmartEVSEData() {
         } else {
             evseConnected = false;
             error = "SmartEVSE Failed";
-            Serial.printf("==== fetchSmartEVSEData() paarsing JSON failed\n");
+            Serial.printf("==== fetchSmartEVSEData() parsing JSON failed\n");
         }
     } else {
         evseConnected = false;
@@ -939,7 +929,7 @@ void drawSmartEVSEDisplay() {
 }
 
 /**
- * Send Mode Change
+ * Send Mode Change.
  *
  * @param newMode 2 = Solar, 3 = Smart
  */
@@ -958,24 +948,29 @@ void sendModeChange(const String &newMode) {
         //     "{\"starttime\":0,\"mode\":\"2\"}" :
         //     "{\"starttime\":0,\"mode\":\"3\",\"override_current\":0}";
         String jsonPayload = "";
-
         int httpResponseCode = http.POST(jsonPayload);
 
         if (httpResponseCode < 300) {
-            String payload = http.getString();
+            const String payload = http.getString();
             // JSON parsing
             JsonDocument doc;
-            DeserializationError error = deserializeJson(doc, payload);
-
-            if (!error) {
+            const DeserializationError jsonError = deserializeJson(doc, payload);
+            if (!jsonError) {
                 String modeId = doc["mode"];
                 if (modeId == "2") {
                     mode = "Solar";
                 } else if (modeId == "3") {
                     mode = "Smart";
+                } else {
+                    Serial.printf("==== sendModeChange() failed, received unexpected modeId: %s\n", modeId.c_str());
+                    error = "Mode failed";
                 }
+            } else {
+                Serial.printf("=== sendModeChange() failed, JSON deserialization failed: %s\n", jsonError.c_str());
+                error = "Mode failed";
             }
         } else {
+            Serial.printf("==== sendModeChange() failed, httpResponseCode: %d\n", httpResponseCode);
             error = "Mode failed";
         }
         http.end();
@@ -1001,7 +996,8 @@ void drawSettingsMenu() {
 
     if (hosts.empty()) {
         M5.Display.setCursor(16, 16);
-        M5.Display.print("No SmartEVSE devices \nfound.");
+        M5.Display.print("No SmartEVSE devices \n");
+        M5.Display.print("found.");
         // Todo show http config screen URL
         return;
     }
@@ -1013,7 +1009,7 @@ void drawSettingsMenu() {
     // Draw the device list, max 4 devices.
     int y = 48;
     for (size_t i = 0; i < hosts.size() && i < 4; i++) {
-        M5.Display.fillRect(16, y, SCREEN_WIDTH - 32, 36, TFT_DARKGREY);
+        M5.Display.fillRect(16, y, M5.Display.width() - 32, 36, TFT_DARKGREY);
         M5.Display.setCursor(24, y + 8);
         M5.Display.print(hosts[i].host);
         y += 44;
@@ -1043,11 +1039,4 @@ void drawSettingsMenu() {
         }
         delay(50);
     }
-}
-
-
-// ---- IP Address Validation ----
-bool isValidIP(const String &ip) {
-    IPAddress addr;
-    return addr.fromString(ip);
 }
