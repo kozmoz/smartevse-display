@@ -58,23 +58,26 @@ IPAddress subnet(255, 255, 255, 0);
 
 // ---- Configuration ----
 Preferences preferences;
-String smartevse_host;
+String smartevseHost;
 
 // EVSE connected
-bool evse_connected = false;
+bool evseConnected = false;
 // WiFi connected
-bool wifi_connected = false;
+bool wifiConnected = false;
 // Show config (SmartEVSE selection screen).
 bool showConfig = false;
 bool dnsServerRunning = false;
 bool reboot = false;
 
-// Globale variabelen
+// Global variables.
 String evseState = "Not Connected";
+// The mode, either Solar or Smart.
 String mode = "Solar";
 int chargeCurrent = 0;
 int gridCurrent = 0;
 String error = "None";
+
+HTTPClient *smartEvseHttpClient = nullptr;
 
 // ---- UI Elements ----
 M5Canvas canvas(&M5.Display);
@@ -228,7 +231,7 @@ esp_err_t httpGetHandler(httpd_req_t *req) {
         JsonDocument doc;
         JsonArray array = doc.to<JsonArray>();
 
-        for (auto & i : networks) {
+        for (auto &i: networks) {
             auto network = array.add<JsonObject>();
             network["ssid"] = i.ssid;
             network["rssi"] = i.rssi;
@@ -306,7 +309,6 @@ esp_err_t httpGetHandler(httpd_req_t *req) {
 }
 
 esp_err_t httpPostHandler(httpd_req_t *req) {
-
     Serial.printf("==== Process POST request uri: %s\n", req->uri);
 
     char buf[128];
@@ -337,7 +339,7 @@ esp_err_t httpPostHandler(httpd_req_t *req) {
         }
 
         preferences.putString("ssid", ssid);
-        preferences.putString("password", password );
+        preferences.putString("password", password);
 
         Serial.printf("==== ssid to preferences: %s\n", ssid.c_str());
         Serial.printf("==== password to preferences: %s\n", password.c_str());
@@ -533,7 +535,7 @@ void initButtons() {
 }
 
 void drawSmartEVSESolarSmartButton() {
-    if (evse_connected) {
+    if (evseConnected) {
         // Clear buttons.
         M5.Display.fillRect(0, BUTTON_Y, 420, BUTTON_HEIGHT, BACKGROUND_COLOR);
 
@@ -548,7 +550,7 @@ void drawSmartEVSESolarSmartButton() {
 }
 
 void drawSmartEVSEConfigButton() {
-    if (!evse_connected) {
+    if (!evseConnected) {
         // Clear buttons.
         M5.Display.fillRect(0, BUTTON_Y, 420, BUTTON_HEIGHT, BACKGROUND_COLOR);
 
@@ -592,18 +594,19 @@ void setup() {
     preferences.begin("se-display", false);
     const String ssid = preferences.getString("ssid");
     const String password = preferences.getString("password");
-    smartevse_host = preferences.getString("smartevse_host");
+    // smartevse_host = preferences.getString("smartevse_host");
+    smartevseHost = "192.168.1.92";
 
     Serial.printf("==== ssid from preferences: %s\n", ssid != nullptr ? ssid.c_str() : "NULL");
     Serial.printf("==== password from preferences: %s\n", password != nullptr ? password.c_str() : "NULL");
     Serial.printf("==== smartevse_host from preferences: %s\n",
-                  smartevse_host != nullptr ? smartevse_host.c_str() : "NULL");
+                  smartevseHost != nullptr ? smartevseHost.c_str() : "NULL");
 
     if (ssid.length() > 0) {
-        wifi_connected = connectToWiFi(ssid, password != nullptr ? password : "");
+        wifiConnected = connectToWiFi(ssid, password != nullptr ? password : "");
     }
 
-    if (!wifi_connected) {
+    if (!wifiConnected) {
         start_ap_mode();
     }
 
@@ -648,15 +651,15 @@ void loop() {
         dnsServer.processNextRequest();
     }
 
-    if (wifi_connected) {
+    if (wifiConnected) {
         // Check for touch events
         if (M5.Touch.getCount() > 0) {
             const auto touchPoint = M5.Touch.getDetail(0);
-            int16_t x = touchPoint.x;
-            int16_t y = touchPoint.y;
+            const int16_t x = touchPoint.x;
+            const int16_t y = touchPoint.y;
 
             // Check Solar button touch.
-            if (evse_connected && mode != "Solar" && solarButton.contains(x, y)) {
+            if (evseConnected && mode != "Solar" && solarButton.contains(x, y)) {
                 mode = "Solar";
                 playBeep();
                 drawSmartEVSESolarSmartButton();
@@ -667,7 +670,7 @@ void loop() {
                 smartEVSEConfigButton.press(false);
             }
             // Check Smart button touch.
-            else if (evse_connected && mode != "Smart" && smartButton.contains(x, y)) {
+            else if (evseConnected && mode != "Smart" && smartButton.contains(x, y)) {
                 mode = "Smart";
                 playBeep();
                 drawSmartEVSESolarSmartButton();
@@ -676,7 +679,7 @@ void loop() {
                 solarButton.press(false);
                 smartButton.press(true);
                 smartEVSEConfigButton.press(false);
-            } else if (!evse_connected && smartEVSEConfigButton.contains(x, y)) {
+            } else if (!evseConnected && smartEVSEConfigButton.contains(x, y)) {
                 showConfig = true;
                 playBeep();
                 solarButton.press(false);
@@ -689,13 +692,15 @@ void loop() {
         // Update every second.
         if (millis() - lastCheck1S >= 1000) {
             lastCheck1S = millis();
+            Serial.printf("==== Loop 1s - drawSmartEVSEDisplay...\n");
             drawSmartEVSEDisplay();
         }
 
-        if (millis() - lastCheck2S >= 2000) {
+        if (false && millis() - lastCheck2S >= 3000) {
             lastCheck2S = millis();
-            // fetchSmartEVSEData();
-            xTaskCreatePinnedToCore(fetchSmartEVSEData, "NetTask", 8192, NULL, 1, NULL, 1);
+            Serial.printf("==== Loop 3s - Fetching data...\n");
+            fetchSmartEVSEData(nullptr);
+            // xTaskCreatePinnedToCore(fetchSmartEVSEData, "NetTask", 8192, NULL, 1, NULL, 1);
             drawSmartEVSESolarSmartButton();
             drawSmartEVSEConfigButton();
             drawUI();
@@ -742,51 +747,51 @@ void showTimeoutMessage();
  * the state to indicate disconnection.
  */
 void fetchSmartEVSEData(void *param) {
-    if (!wifi_connected) {
-        evse_connected = false;
+    if (!wifiConnected) {
+        evseConnected = false;
         return;
     }
-    if (!smartevse_host) {
-        evse_connected = false;
+    if (!smartevseHost) {
+        evseConnected = false;
         error = "No SmartEVSE host";
         return;
     }
 
     HTTPClient http;
-    String url = "http://" + smartevse_host + "/settings";
+    String url = "http://" + smartevseHost + "/settings";
     http.begin(url);
-    http.setTimeout(5000);
+    http.setTimeout(1500);
 
     const int httpResponseCode = http.GET();
 
     if (httpResponseCode < 300) {
         String payload = http.getString();
-        evse_connected = true;
+        evseConnected = true;
 
-        // JSON parsing
+        // JSON parsing.
         JsonDocument doc;
-        DeserializationError jsonError = deserializeJson(doc, payload);
+        const DeserializationError jsonError = deserializeJson(doc, payload);
 
         if (!jsonError) {
-            // Extract values from JSON en update de globale variabelen
+            // Extract values from JSON and update the global variables.
             chargeCurrent = doc["settings"]["charge_current"];
             gridCurrent = doc["phase_currents"]["TOTAL"];
-            String evseStateId = doc["evse"]["state"];
-            int modeId = doc["mode_id"];
+            const String evseStateText = doc["evse"]["state"];
+            const int modeId = doc["mode_id"];
 
-            evseState = evseStateId;
-
+            evseState = evseStateText;
             if (modeId == 2) {
                 mode = "Solar";
             } else if (modeId == 3) {
                 mode = "Smart";
             }
+            // Todo: Handle other modes.
         } else {
-            evse_connected = false;
+            evseConnected = false;
             error = "SmartEVSE Failed";
         }
     } else {
-        evse_connected = false;
+        evseConnected = false;
         error = "SmartEVSE Timeout";
     }
     http.end();
@@ -810,18 +815,18 @@ void drawUI() {
     M5.Display.setTextColor(TFT_LIGHTGRAY);
     M5.Display.setCursor(16, 204);
     M5.Display.print("WIFI");
-    M5.Display.fillCircle(76, 210, 5, wifi_connected ? TFT_GREEN : TFT_RED);
+    M5.Display.fillCircle(76, 210, 5, wifiConnected ? TFT_GREEN : TFT_RED);
 
     // The EVSE Status Indicator.
     M5.Display.setTextColor(TFT_LIGHTGRAY);
     M5.Display.setCursor(100, 204);
     M5.Display.print("EVSE ");
-    M5.Display.fillCircle(160, 210, 5, evse_connected ? TFT_GREEN : TFT_RED);
+    M5.Display.fillCircle(160, 210, 5, evseConnected ? TFT_GREEN : TFT_RED);
 
     // The Mode.
     M5.Display.setTextColor(TFT_LIGHTGRAY);
     M5.Display.setCursor(184, 204);
-    M5.Display.print("Mode:" + (evse_connected ? mode : "-"));
+    M5.Display.print("Mode:" + (evseConnected ? mode : "-"));
 
     // Show Error.
     M5.Display.setTextColor(error == "" || error == "None" ? TFT_DARKGRAY : TFT_RED);
@@ -835,37 +840,56 @@ void drawUI() {
 
 // ---- Draw EVSE Screen (Live) ----
 void drawSmartEVSEDisplay() {
-    if (wifi_connected) {
-        HTTPClient http;
-        const String url = "http://" + smartevse_host + "/lcd";
-        http.begin(url);
-        http.setTimeout(5000);
+    if (!wifiConnected) {
+        return;
+    }
 
-        const int httpResponseCode = http.GET();
+    if (smartEvseHttpClient == nullptr) {
+        const String url = "http://" + smartevseHost + "/lcd";
+        smartEvseHttpClient = new HTTPClient();
+        smartEvseHttpClient->begin(url);
+        smartEvseHttpClient->setTimeout(750);
+        smartEvseHttpClient->addHeader("User-Agent", "SmartEVSE-display");
+        smartEvseHttpClient->addHeader("Connection", "keep-alive");
+        smartEvseHttpClient->addHeader("Accept", "image/bmp");
+    }
 
-        if (httpResponseCode == 200) {
-            WiFiClient *stream = http.getStreamPtr();
-            displayMonochromeBitmap(stream, 128, 64, 32, 0);
-        } else {
-            // Display placeholder image.
-            auto path = String("/data/lcd-placeholder.png").c_str();
-            size_t size = 0;
-            time_t mtime = 0;
-            const char *data = mg_unpack(path, &size, &mtime);
-            if (data != nullptr) {
-                if (!M5.Display.drawPng((uint8_t *) data, size, 32, 0)) {
-                    M5.Display.setTextColor(TFT_RED);
-                    M5.Display.setCursor(16, 10);
-                    M5.Display.println("Failed to decode PNG");
-                }
-            } else {
-                // Thos cannot happen.
-                M5.Display.setTextColor(TFT_RED);
-                M5.Display.setCursor(16, 10);
-                M5.Display.println("File not found");
-            }
-        }
-        http.end();
+    const int httpResponseCode = smartEvseHttpClient->GET();
+    Serial.printf("==== drawSmartEVSEDisplay() httpResponseCode: %d\n", httpResponseCode);
+
+    constexpr int imageX = 32;
+    if (httpResponseCode < 300) {
+        // The call was successful.
+        WiFiClient *stream = smartEvseHttpClient->getStreamPtr();
+        displayMonochromeBitmap(stream, 128, 64, imageX, 0);
+        smartEvseHttpClient->end();
+        return;
+    }
+
+    // Force it to create a new http client the next time.
+    smartEvseHttpClient->end();
+    delete smartEvseHttpClient;
+    smartEvseHttpClient = nullptr;
+
+    // Display placeholder image.
+    size_t size = 0;
+    time_t mtime = 0;
+    const auto path = String("/data/lcd-placeholder.png").c_str();
+    const char *data = mg_unpack(path, &size, &mtime);
+
+    if (data == nullptr) {
+        // This cannot happen, show error.
+        M5.Display.setTextColor(TFT_RED);
+        M5.Display.setCursor(imageX, 10);
+        M5.Display.println("File not found");
+        return;
+    }
+
+    // Display the "No Conn" image.
+    if (!M5.Display.drawPng(reinterpret_cast<const uint8_t *>(data), size, imageX, 0)) {
+        M5.Display.setTextColor(TFT_RED);
+        M5.Display.setCursor(imageX, 10);
+        M5.Display.println("Failed to decode PNG");
     }
 }
 
@@ -875,10 +899,10 @@ void drawSmartEVSEDisplay() {
  * @param newMode 2 = Solar, 3 = Smart
  */
 void sendModeChange(const String &newMode) {
-    if (wifi_connected) {
+    if (wifiConnected) {
         HTTPClient http;
         // String url = "http://" + evse_ip + "/settings?mode=" + newMode + "&starttime=0&override_current=0&repeat=0";
-        String url = "http://" + smartevse_host + "/settings?mode=" + newMode +
+        String url = "http://" + smartevseHost + "/settings?mode=" + newMode +
                      "&override_current=0&starttime=2025-05-15T00:27&stoptime=2025-05-15T00:27&repeat=0";
 
         http.begin(url);
@@ -918,7 +942,7 @@ void drawSettingsMenu() {
     // Clear screen
     M5.Display.fillScreen(BACKGROUND_COLOR);
     M5.Display.setTextColor(TEXT_COLOR);
-    M5.Display.setTextSize(2);
+    M5.Display.setTextSize(3);
 
     // Show the loading message.
     M5.Display.setCursor(0, 0);
@@ -959,11 +983,12 @@ void drawSettingsMenu() {
 
             for (size_t i = 0; i < hosts.size() && i < 4; i++) {
                 if (touchY >= y + i * 44 && touchY < y + (i + 1) * 44) {
+                    playBeep();
                     // Clear the screen again.
                     M5.Display.fillScreen(BACKGROUND_COLOR);
                     // Store the selected host.
-                    smartevse_host = hosts[i].ip;
-                    preferences.putString("smartevse_host", smartevse_host);
+                    smartevseHost = hosts[i].ip;
+                    preferences.putString("smartevse_host", smartevseHost);
                     showConfig = false;
                     // Try to connect to the device.
                     fetchSmartEVSEData(nullptr);
