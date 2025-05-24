@@ -946,6 +946,12 @@ void drawSmartEvseDeviceSelection() {
         y += 44;
     }
 
+    // Process any pending touch events and wait for release.
+    M5.update();
+    while (M5.Touch.getCount() > 0) {
+        M5.update();
+    }
+
     smartEvseHost = "";
     while (smartEvseHost == "") {
         M5.update();
