@@ -27,7 +27,7 @@ struct packed_file {
     time_t mtime;
 };
 
-extern const struct packed_file packed_files[];
+extern const packed_file packed_files[];
 }
 
 #define WIFI_SSID "SmartEVSE_Display"
@@ -447,9 +447,9 @@ void startApMode() {
 
 void displayMonochromeBitmap(WiFiClient *stream, const int width, const int height, const int x, const int y,
                              const int foregroundColor = TFT_WHITE, const int backgroundColor = TFT_BLACK) {
-    // Skip the bitmap header
-    // Todo: The header is off.
-    // uint8_t header[62];
+    // Skip the bitmap header.
+    // The BMP header is off, should be 62, figure out what's going on.
+    // Uint8_t header[62];
     uint8_t header[67];
     stream->read(header, sizeof(header));
 
@@ -619,6 +619,10 @@ void showTimeoutMessage();
  * the state to indicate disconnection.
  */
 void fetchSmartEVSEData() {
+    const String ERROR_NO_HOST = "No SmartEVSE host";
+    const String ERROR_JSON_FAILED = "SmartEVSE Failed";
+    const String ERROR_TIMEOUT = "SmartEVSE Timeout";
+
     Serial.printf("==== fetchSmartEVSEData() for host: \"%s\"\n", smartEvseHost.c_str());
     if (!wifiConnected) {
         evseConnected = false;
@@ -627,7 +631,7 @@ void fetchSmartEVSEData() {
     if (smartEvseHost == nullptr || smartEvseHost.isEmpty()) {
         Serial.printf("==== fetchSmartEVSEData() smartEvseHost is empty\n");
         evseConnected = false;
-        error = "No SmartEVSE host";
+        error = ERROR_NO_HOST;
         return;
     }
 
@@ -655,20 +659,39 @@ void fetchSmartEVSEData() {
             const int modeId = doc["mode_id"];
 
             evseState = evseStateText;
-            if (modeId == 2) {
-                mode = "Solar";
-            } else if (modeId == 3) {
-                mode = "Smart";
+            switch (modeId) {
+                case 0:
+                    mode = "Off";
+                    break;
+                case 1:
+                    mode = "Normal";
+                    break;
+                case 2:
+                    mode = "Solar";
+                    break;
+                case 3:
+                    mode = "Smart";
+                    break;
+                case 4:
+                    mode = "Pause";
+                    break;
+                default:
+                    mode = "Unknown";
+                    break;
             }
-            // Todo: Handle other modes.
+
+            // Clear any SmartEVSE-related error.
+            if (error == ERROR_NO_HOST || error == ERROR_JSON_FAILED || error == ERROR_TIMEOUT) {
+                error = "";
+            }
         } else {
             evseConnected = false;
-            error = "SmartEVSE Failed";
+            error = ERROR_JSON_FAILED;
             Serial.printf("==== fetchSmartEVSEData() parsing JSON failed\n");
         }
     } else {
         evseConnected = false;
-        error = "SmartEVSE Timeout";
+        error = ERROR_TIMEOUT;
     }
     http.end();
 }
@@ -782,47 +805,57 @@ void drawSmartEvseDisplay() {
  * @param newMode 2 = Solar, 3 = Smart
  */
 void sendModeChange(const String &newMode) {
-    if (wifiConnected) {
-        HTTPClient http;
-        // String url = "http://" + evse_ip + "/settings?mode=" + newMode + "&starttime=0&override_current=0&repeat=0";
-        String url = "http://" + smartEvseHost + ".local/settings?mode=" + newMode +
-                     "&override_current=0&starttime=2025-05-15T00:27&stoptime=2025-05-15T00:27&repeat=0";
+    const String ERROR_MODE_FAILED = "Mode failed";
 
-        http.begin(url);
-        // http.addHeader("Content-Type", "application/json");
-        http.addHeader("Content-Length", "0");
+    if (!wifiConnected) {
+        return;
+    }
 
-        // String jsonPayload = (newMode == "2") ?
-        //     "{\"starttime\":0,\"mode\":\"2\"}" :
-        //     "{\"starttime\":0,\"mode\":\"3\",\"override_current\":0}";
-        String jsonPayload = "";
-        int httpResponseCode = http.POST(jsonPayload);
+    HTTPClient http;
+    // String url = "http://" + evse_ip + "/settings?mode=" + newMode + "&starttime=0&override_current=0&repeat=0";
+    String url = "http://" + smartEvseHost + ".local/settings?mode=" + newMode +
+                 "&override_current=0&starttime=2025-05-15T00:27&stoptime=2025-05-15T00:27&repeat=0";
 
-        if (httpResponseCode < 300) {
-            const String payload = http.getString();
-            // JSON parsing
-            JsonDocument doc;
-            const DeserializationError jsonError = deserializeJson(doc, payload);
-            if (!jsonError) {
-                String modeId = doc["mode"];
-                if (modeId == "2") {
-                    mode = "Solar";
-                } else if (modeId == "3") {
-                    mode = "Smart";
-                } else {
-                    Serial.printf("==== sendModeChange() failed, received unexpected modeId: %s\n", modeId.c_str());
-                    error = "Mode failed";
-                }
+    http.begin(url);
+    // http.addHeader("Content-Type", "application/json");
+    http.addHeader("Content-Length", "0");
+
+    // String jsonPayload = (newMode == "2") ?
+    //     "{\"starttime\":0,\"mode\":\"2\"}" :
+    //     "{\"starttime\":0,\"mode\":\"3\",\"override_current\":0}";
+    String jsonPayload = "";
+    int httpResponseCode = http.POST(jsonPayload);
+
+    if (httpResponseCode >= 200 && httpResponseCode < 300) {
+        const String payload = http.getString();
+        // JSON parsing
+        JsonDocument doc;
+        const DeserializationError jsonError = deserializeJson(doc, payload);
+        if (!jsonError) {
+
+            // Clear all errors related to mode.
+            if (error == ERROR_MODE_FAILED) {
+                error = "";
+            }
+
+            String modeId = doc["mode"];
+            if (modeId == "2") {
+                mode = "Solar";
+            } else if (modeId == "3") {
+                mode = "Smart";
             } else {
-                Serial.printf("=== sendModeChange() failed, JSON deserialization failed: %s\n", jsonError.c_str());
-                error = "Mode failed";
+                Serial.printf("==== sendModeChange() failed, received unexpected modeId: %s\n", modeId.c_str());
+                error = ERROR_MODE_FAILED;
             }
         } else {
-            Serial.printf("==== sendModeChange() failed, httpResponseCode: %d\n", httpResponseCode);
-            error = "Mode failed";
+            Serial.printf("=== sendModeChange() failed, JSON deserialization failed: %s\n", jsonError.c_str());
+            error = ERROR_MODE_FAILED;
         }
-        http.end();
+    } else {
+        Serial.printf("==== sendModeChange() failed, httpResponseCode: %d\n", httpResponseCode);
+        error = ERROR_MODE_FAILED;
     }
+    http.end();
 }
 
 /**
@@ -1056,12 +1089,15 @@ void loop() {
             mode = "Smart";
             drawSmartButton(true);
         }
-        if (solarButton.justReleased() || smartButton.justReleased()) {
+        const bool solarButtonReleased = solarButton.justReleased();
+        const bool smartButtonReleased = smartButton.justReleased();
+        if (solarButtonReleased || smartButtonReleased) {
             Serial.printf("==== Loop - solar- or smartButton.justReleased()\n");
             // Update the active state of both buttons.
             drawSolarButton(false);
             drawSmartButton(false);
-            // Todo:sendModeChange("2");
+
+            sendModeChange(solarButtonReleased ? "2" : "3");
         }
         if (configButton.justPressed()) {
             Serial.printf("==== Loop - configButton.justPressed()\n");
@@ -1089,8 +1125,9 @@ void loop() {
         if (millis() - lastCheck3S >= 3000) {
             lastCheck3S = millis();
             Serial.printf("==== Loop 3s - Fetching data...\n");
-            // Todo: Move fetchSmartEVSEData() to FreeRTOS task?
-            bool previousEvseConnected = evseConnected;
+
+            // Improvement? Move fetchSmartEVSEData() to FreeRTOS task?
+            const bool previousEvseConnected = evseConnected;
             fetchSmartEVSEData();
             drawStatus();
 
