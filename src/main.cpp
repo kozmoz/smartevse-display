@@ -56,6 +56,8 @@ const String PREFERENCES_KEY_EVSE_HOST = "smartevse_host";
 const String PREFERENCES_KEY_WIFI_SSID = "ssid";
 const String PREFERENCES_KEY_WIFI_PASSWORD = "password";
 
+constexpr unsigned long LONG_PRESS_TIME = 2000;
+
 // AP_HOSTNAME will be defined in the setup().
 String AP_HOSTNAME;
 
@@ -159,26 +161,27 @@ std::vector<WifiNetwork> scanWifiNetworks() {
     return networks;
 }
 
-static std::vector<MDNSHost> cached_mdns_hosts;
-static unsigned long last_mdns_query = 0;
+static std::vector<MDNSHost> cachedMdnsHosts;
+static unsigned long lastMdnsQuery = 0;
 constexpr unsigned long MDNS_QUERY_INTERVAL = 30000;
 
-std::vector<MDNSHost> discoverMDNS() {
-    unsigned long current_time = millis();
+std::vector<MDNSHost> discoverMDNS(const bool forceFreshList = false) {
+    const unsigned long currentTime = millis();
 
-    if (last_mdns_query != 0 && current_time - last_mdns_query < MDNS_QUERY_INTERVAL) {
-        return cached_mdns_hosts;
+    if (!forceFreshList && lastMdnsQuery != 0 && currentTime - lastMdnsQuery < MDNS_QUERY_INTERVAL) {
+        return cachedMdnsHosts;
     }
-    last_mdns_query = current_time;
+    lastMdnsQuery = currentTime;
 
     std::vector<MDNSHost> hosts;
-    int retry_count = 3;
+    int retryCount = 3;
 
-    while (retry_count > 0) {
+    while (retryCount > 0) {
         const int n = MDNS.queryService("http", "tcp");
         if (n > 0) {
             for (int i = 0; i < n; i++) {
                 const String hostname = MDNS.hostname(i);
+                // Only include SmartEVSE hosts.
                 if (!hostname.startsWith("SmartEVSE-")) {
                     continue;
                 }
@@ -200,15 +203,15 @@ std::vector<MDNSHost> discoverMDNS() {
                 }
             }
         }
-        retry_count--;
+        retryCount--;
         delay(1000); // Wait between retries.
     }
 
     if (!hosts.empty()) {
-        cached_mdns_hosts = hosts;
+        cachedMdnsHosts = hosts;
     }
 
-    return !hosts.empty() ? hosts : cached_mdns_hosts;
+    return !hosts.empty() ? hosts : cachedMdnsHosts;
 }
 
 esp_err_t httpGetHandler(httpd_req_t *req) {
@@ -557,8 +560,13 @@ void playBeep(const float frequency = 1000, const int duration = 50) {
     M5.Speaker.tone(frequency, duration);
 }
 
+static unsigned long pressStartTime = 0;
+static bool isLongPress = false;
+
 void handleTouchInput(const bool touchDetected) {
     if (!touchDetected) {
+        isLongPress = false;
+        pressStartTime = 0;
         solarButton.press(false);
         smartButton.press(false);
         configButton.press(false);
@@ -568,6 +576,17 @@ void handleTouchInput(const bool touchDetected) {
     const auto touchPoint = M5.Touch.getDetail(0);
     const int16_t x = touchPoint.x;
     const int16_t y = touchPoint.y;
+
+    // Check for long press in the top area of the display.
+    if (y < 128) {
+        if (pressStartTime == 0) {
+            pressStartTime = millis();
+        } else if (millis() - pressStartTime >= LONG_PRESS_TIME && !isLongPress) {
+            Serial.printf("==== handleTouchInput() long press detected\n");
+            isLongPress = true;
+            configButton.press(true);
+        }
+    }
 
     if (evseConnected) {
         bool solarButtonPressed = solarButton.contains(x, y);
@@ -824,7 +843,7 @@ void sendModeChange(const String &newMode) {
     //     "{\"starttime\":0,\"mode\":\"2\"}" :
     //     "{\"starttime\":0,\"mode\":\"3\",\"override_current\":0}";
     String jsonPayload = "";
-    int httpResponseCode = http.POST(jsonPayload);
+    const int httpResponseCode = http.POST(jsonPayload);
 
     if (httpResponseCode >= 200 && httpResponseCode < 300) {
         const String payload = http.getString();
@@ -832,7 +851,6 @@ void sendModeChange(const String &newMode) {
         JsonDocument doc;
         const DeserializationError jsonError = deserializeJson(doc, payload);
         if (!jsonError) {
-
             // Clear all errors related to mode.
             if (error == ERROR_MODE_FAILED) {
                 error = "";
@@ -877,7 +895,7 @@ void drawSmartEvseDeviceSelection() {
     M5.Display.print("Please wait...");
 
     // Get the list of SmartEVSE devices.
-    const auto hosts = discoverMDNS();
+    const auto hosts = discoverMDNS(true);
 
     // Clear the screen again.
     M5.Display.fillScreen(BACKGROUND_COLOR);
@@ -1112,6 +1130,7 @@ void loop() {
             // Clear errors and buttons.
             error = "";
             clearButtonsArea();
+            evseConnected = false;
             drawStatus();
         }
 
