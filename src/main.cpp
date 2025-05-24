@@ -522,19 +522,19 @@ void initButtons() {
                             "Select EVSE", 3);
 }
 
-void drawSolarButton(const bool pressed, const bool clear = false) {
+void drawSolarButton(const bool pressed = false) {
     solarButton.setFillColor(0xF680);
     solarButton.setOutlineColor(mode == "Solar" ? ACTIVE_BORDER_COLOR : BACKGROUND_COLOR);
     solarButton.drawButton(pressed);
 }
 
-void drawSmartButton(const bool pressed, const bool clear = false) {
+void drawSmartButton(const bool pressed = false) {
     smartButton.setFillColor(0x07E0);
     smartButton.setOutlineColor(mode == "Smart" ? ACTIVE_BORDER_COLOR : BACKGROUND_COLOR);
     smartButton.drawButton(pressed);
 }
 
-void drawConfigButton(const bool pressed = false, const bool clear = false) {
+void drawConfigButton(const bool pressed = false) {
     configButton.setFillColor(TFT_RED);
     configButton.setOutlineColor(ACTIVE_BORDER_COLOR);
     configButton.drawButton(pressed);
@@ -1128,6 +1128,7 @@ void loop() {
 
             // Improvement? Move fetchSmartEVSEData() to FreeRTOS task?
             const bool previousEvseConnected = evseConnected;
+            const String previousMode = mode;
             fetchSmartEVSEData();
             drawStatus();
 
@@ -1140,6 +1141,12 @@ void loop() {
                 } else {
                     drawConfigButton(false);
                 }
+            }
+
+            // If the mode changed, update the outline of the border,
+            if (mode != previousMode) {
+                drawSolarButton();
+                drawSmartButton();
             }
         }
     }
