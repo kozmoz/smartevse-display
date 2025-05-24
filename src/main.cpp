@@ -103,7 +103,7 @@ void drawStatus();
 
 void fetchSmartEVSEData();
 
-void drawSmartEVSEDisplay();
+void drawSmartEvseDisplay();
 
 void drawSettingsMenu();
 
@@ -611,7 +611,7 @@ void setup() {
     const String password = preferences.getString("password");
     // Todo: enable smartevse_host
     // smartevse_host = preferences.getString("smartevse_host");
-    smartEvseHost = "192.168.1.92";
+    // smartEvseHost = "192.168.1.92";
 
     Serial.printf("==== ssid from preferences: %s\n", ssid != nullptr ? ssid.c_str() : "NULL");
     Serial.printf("==== password from preferences: %s\n", password != nullptr ? password.c_str() : "NULL");
@@ -714,7 +714,7 @@ void loop() {
     }
 
     if (wifiConnected) {
-        // Check for touch events
+        // Check for touch events for the three buttons.
         const bool touchDetected = M5.Touch.getCount() > 0;
         handleTouchInput(touchDetected);
 
@@ -737,12 +737,22 @@ void loop() {
             drawSolarButton(false);
             drawSmartButton(false);
         }
+        if (configButton.justPressed()) {
+            Serial.printf("==== Loop - configButton.justPressed()\n");
+            playBeep(1000);
+            drawConfigButton(true);
+        }
+        if (configButton.justReleased()) {
+            Serial.printf("==== Loop - configButton.justReleased()\n");
+            drawConfigButton(false);
+            drawSettingsMenu();
+        }
 
         // Update every second.
         if (millis() - lastCheck1S >= 1000) {
             lastCheck1S = millis();
             Serial.printf("==== Loop 1s - drawSmartEVSEDisplay...\n");
-            drawSmartEVSEDisplay();
+            drawSmartEvseDisplay();
         }
 
         if (millis() - lastCheck3S >= 3000) {
@@ -784,11 +794,13 @@ void showTimeoutMessage();
  * the state to indicate disconnection.
  */
 void fetchSmartEVSEData() {
+    Serial.printf("==== fetchSmartEVSEData() for host: \"%s\"\n", smartEvseHost.c_str());
     if (!wifiConnected) {
         evseConnected = false;
         return;
     }
-    if (!smartEvseHost) {
+    if (smartEvseHost == nullptr || smartEvseHost.isEmpty()) {
+        Serial.printf("==== fetchSmartEVSEData() smartEvseHost is empty\n");
         evseConnected = false;
         error = "No SmartEVSE host";
         return;
@@ -876,12 +888,41 @@ void drawStatus() {
 }
 
 
+void drawSmartEvseNoConnection() {
+    constexpr int imageX = 32;
+    // Display placeholder image.
+    size_t size = 0;
+    time_t mtime = 0;
+    const auto path = String("/data/lcd-placeholder.png").c_str();
+    const char *data = mg_unpack(path, &size, &mtime);
+
+    if (data == nullptr) {
+        // This cannot happen, show error.
+        M5.Display.setTextColor(TFT_RED);
+        M5.Display.setCursor(imageX, 10);
+        M5.Display.println("File not found");
+        return;
+    }
+
+    // Display the "No Conn" image.
+    if (!M5.Display.LGFXBase::drawPng(reinterpret_cast<const uint8_t *>(data), size, imageX, 0)) {
+        M5.Display.setTextColor(TFT_RED);
+        M5.Display.setCursor(imageX, 10);
+        M5.Display.println("Failed to decode PNG");
+    }
+}
+
 /**
  * Draw the SmartEVSE LCD screen.
  * If not connected to a network, do nothing.
  */
-void drawSmartEVSEDisplay() {
+void drawSmartEvseDisplay() {
     if (!wifiConnected) {
+        return;
+    }
+
+    if (smartEvseHost == nullptr || smartEvseHost.isEmpty()) {
+        drawSmartEvseNoConnection();
         return;
     }
 
@@ -899,7 +940,7 @@ void drawSmartEVSEDisplay() {
     Serial.printf("==== drawSmartEVSEDisplay() httpResponseCode: %d\n", httpResponseCode);
 
     constexpr int imageX = 32;
-    if (httpResponseCode < 300) {
+    if (httpResponseCode >= 200 && httpResponseCode < 300) {
         // The call was successful.
         WiFiClient *stream = smartEvseHttpClient->getStreamPtr();
         displayMonochromeBitmap(stream, 128, 64, imageX, 0);
@@ -912,26 +953,8 @@ void drawSmartEVSEDisplay() {
     delete smartEvseHttpClient;
     smartEvseHttpClient = nullptr;
 
-    // Display placeholder image.
-    size_t size = 0;
-    time_t mtime = 0;
-    const auto path = String("/data/lcd-placeholder.png").c_str();
-    const char *data = mg_unpack(path, &size, &mtime);
-
-    if (data == nullptr) {
-        // This cannot happen, show error.
-        M5.Display.setTextColor(TFT_RED);
-        M5.Display.setCursor(imageX, 10);
-        M5.Display.println("File not found");
-        return;
-    }
-
-    // Display the "No Conn" image.
-    if (!M5.Display.drawPng(reinterpret_cast<const uint8_t *>(data), size, imageX, 0)) {
-        M5.Display.setTextColor(TFT_RED);
-        M5.Display.setCursor(imageX, 10);
-        M5.Display.println("Failed to decode PNG");
-    }
+    // No copnnection.
+    drawSmartEvseNoConnection();
 }
 
 /**
@@ -983,16 +1006,19 @@ void sendModeChange(const String &newMode) {
     }
 }
 
-
 void drawSettingsMenu() {
     // Clear screen
     M5.Display.fillScreen(BACKGROUND_COLOR);
     M5.Display.setTextColor(TEXT_COLOR);
-    M5.Display.setTextSize(3);
+    M5.Display.setTextSize(2);
 
     // Show the loading message.
     M5.Display.setCursor(0, 0);
-    M5.Display.print("Discovering \nSmartEVSE devices.\n\nPlease wait...");
+    M5.Display.print("Discovering");
+    M5.Display.setCursor(0, 20);
+    M5.Display.print("SmartEVSE devices.");
+    M5.Display.setCursor(0, 60);
+    M5.Display.print("Please wait...");
 
     // Get the list of SmartEVSE devices.
     const auto hosts = discoverMDNS();
@@ -1004,7 +1030,7 @@ void drawSettingsMenu() {
         M5.Display.setCursor(16, 16);
         M5.Display.print("No SmartEVSE devices \n");
         M5.Display.print("found.");
-        // Todo show http config screen URL
+        delay(5000);
         return;
     }
 
@@ -1013,36 +1039,52 @@ void drawSettingsMenu() {
     M5.Display.print("Select device:");
 
     // Draw the device list, max 4 devices.
+    // Create vector of buttons for host selection
+    std::vector<LGFX_Button> hostButtons;
+    hostButtons.resize(std::min(hosts.size(), size_t(4)));
+
+    // Initialize and draw buttons
     int y = 48;
-    for (size_t i = 0; i < hosts.size() && i < 4; i++) {
-        M5.Display.fillRect(16, y, M5.Display.width() - 32, 36, TFT_DARKGREY);
-        M5.Display.setCursor(24, y + 8);
-        M5.Display.print(hosts[i].host);
+    for (size_t i = 0; i < hostButtons.size(); i++) {
+        auto &button = hostButtons[i];
+        button.initButton(&M5.Display,
+                          M5.Display.width() / 2, // x center
+                          y + 18, // y center (36px height button)
+                          M5.Display.width() - 32, // width
+                          36, // height
+                          TFT_DARKGREY, // fill
+                          TFT_WHITE, // outline
+                          TFT_BLACK, // text
+                          ("SN:" + hosts[i].serial + " " + hosts[i].ip).c_str(),
+                          2 // text size
+        );
+        button.drawButton(false);
         y += 44;
     }
 
-    // Handle the touch selection.
     while (true) {
         M5.update();
         if (M5.Touch.getCount() > 0) {
             const auto touchPoint = M5.Touch.getDetail(0);
+            const int16_t touchX = touchPoint.x;
             const int16_t touchY = touchPoint.y;
 
-            for (size_t i = 0; i < hosts.size() && i < 4; i++) {
-                if (touchY >= y + i * 44 && touchY < y + (i + 1) * 44) {
-                    playBeep();
-                    // Clear the screen again.
-                    M5.Display.fillScreen(BACKGROUND_COLOR);
-                    // Store the selected host.
-                    smartEvseHost = hosts[i].ip;
-                    preferences.putString("smartevse_host", smartEvseHost);
-                    showConfig = false;
-                    // Try to connect to the device.
-                    fetchSmartEVSEData();
-                    return;
-                }
+            for (auto &button: hostButtons) {
+                button.press(button.contains(touchX, touchY));
+            }
+        } else {
+            for (auto &button: hostButtons) {
+                button.press(false);
             }
         }
-        delay(50);
+
+        for (auto &button: hostButtons) {
+            if (button.justPressed()) {
+                playBeep(1000);
+                button.drawButton(true);
+            } else if (button.justReleased()) {
+                button.drawButton(false);
+            }
+        }
     }
 }
